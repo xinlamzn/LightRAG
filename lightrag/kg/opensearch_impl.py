@@ -10,6 +10,7 @@ Requirements:
 """
 
 import hashlib
+import json as json_module
 import os
 import re
 import ssl as ssl_module
@@ -966,6 +967,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
 
         Returns:
             Raw response dict from the ``_plugins/_cypher`` endpoint.
+            The graph plugin returns either:
+            - Write queries: ``{"stats": {"nodesCreated": N, ...}}``
+            - Read queries: ``{"columns": ["a", "b"], "data": [{"a": 1, "b": 2}, ...]}``
         """
         body: dict[str, Any] = {
             "query": query,
@@ -982,6 +986,20 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 f"[{self.workspace}] Cypher query failed: {e}\nQuery: {query}"
             )
             raise
+
+    @staticmethod
+    def _cypher_rows(resp: dict) -> list[list]:
+        """Extract result rows from a Cypher response as positional lists.
+
+        The graph plugin returns ``{"columns": ["a","b"], "data": [{"a":1,"b":2}]}``
+        which this helper normalises to ``[[1, 2], ...]`` so callers can use
+        positional indexing (``row[0]``, ``row[1]``).
+        """
+        columns = resp.get("columns", [])
+        data = resp.get("data", [])
+        if not columns or not data:
+            return []
+        return [[item.get(col) for col in columns] for item in data]
 
     # --- Database lifecycle ---
 
@@ -1006,8 +1024,15 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 f"[{self.workspace}] Created graph database: {self._database_name} (dim={dim})"
             )
         except Exception as e:
-            # If database already exists, that's fine
-            if "already_exists" in str(e).lower() or "resource_already_exists" in str(e).lower():
+            # If database already exists, that's fine.  The graph plugin
+            # returns HTTP 409 with body "Already exists" (or similar).
+            err_lower = str(e).lower()
+            if (
+                "already exists" in err_lower
+                or "already_exists" in err_lower
+                or "resource_already_exists" in err_lower
+                or isinstance(e, ConflictError)
+            ):
                 logger.debug(
                     f"[{self.workspace}] Graph database already exists: {self._database_name}"
                 )
@@ -1083,9 +1108,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "MATCH (n:Entity {entity_id: $id}) RETURN count(n) > 0 AS exists",
                 {"id": node_id},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
+            rows = self._cypher_rows(resp)
             if rows:
-                return bool(rows[0].get("row", [False])[0])
+                return bool(rows[0][0])
             return False
         except Exception:
             return False
@@ -1100,9 +1125,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN count(r) > 0 AS exists",
                 {"src": source_node_id, "tgt": target_node_id},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
+            rows = self._cypher_rows(resp)
             if rows:
-                return bool(rows[0].get("row", [False])[0])
+                return bool(rows[0][0])
             return False
         except Exception:
             return False
@@ -1118,9 +1143,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN count(r) AS degree",
                 {"id": node_id},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
+            rows = self._cypher_rows(resp)
             if rows:
-                return int(rows[0].get("row", [0])[0])
+                return int(rows[0][0])
             return 0
         except Exception:
             return 0
@@ -1140,9 +1165,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "MATCH (n:Entity {entity_id: $id}) RETURN properties(n) AS props",
                 {"id": node_id},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
+            rows = self._cypher_rows(resp)
             if rows:
-                props = rows[0].get("row", [None])[0]
+                props = rows[0][0]
                 if props:
                     props.pop("embedding", None)
                     return props
@@ -1162,9 +1187,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN properties(r) AS props LIMIT 1",
                 {"src": source_node_id, "tgt": target_node_id},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
+            rows = self._cypher_rows(resp)
             if rows:
-                return rows[0].get("row", [None])[0]
+                return rows[0][0]
             return None
         except Exception:
             return None
@@ -1179,8 +1204,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN n.entity_id AS src, c.entity_id AS tgt",
                 {"id": source_node_id},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
-            return [(r["row"][0], r["row"][1]) for r in rows]
+            rows = self._cypher_rows(resp)
+            return [(r[0], r[1]) for r in rows]
         except Exception:
             return None
 
@@ -1198,9 +1223,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 {"ids": node_ids},
             )
             result = {}
-            for row in resp.get("results", [{}])[0].get("data", []):
-                eid = row["row"][0]
-                props = row["row"][1]
+            for row in self._cypher_rows(resp):
+                eid = row[0]
+                props = row[1]
                 if props:
                     props.pop("embedding", None)
                     result[eid] = props
@@ -1221,8 +1246,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 {"ids": node_ids},
             )
             result = {}
-            for row in resp.get("results", [{}])[0].get("data", []):
-                result[row["row"][0]] = int(row["row"][1])
+            for row in self._cypher_rows(resp):
+                result[row[0]] = int(row[1])
             return result
         except Exception:
             return {}
@@ -1241,8 +1266,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN n.entity_id AS src, c.entity_id AS tgt",
                 {"ids": node_ids},
             )
-            for row in resp.get("results", [{}])[0].get("data", []):
-                src, tgt = row["row"][0], row["row"][1]
+            for row in self._cypher_rows(resp):
+                src, tgt = row[0], row[1]
                 if src in result:
                     result[src].append((src, tgt))
                 if tgt in result and tgt != src:
@@ -1261,18 +1286,33 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if node_data.get("source_id", ""):
             props["source_ids"] = node_data["source_id"].split(GRAPH_FIELD_SEP)
 
-        # Build dynamic label for entity_type
+        # Build dynamic label for entity_type.  The label clause is appended
+        # with a comma inside ON CREATE/ON MATCH SET (a bare ``SET n:`label```
+        # between ON clauses would be a Cypher parse error).
         entity_type = node_data.get("entity_type", "")
         label_clause = ""
         if entity_type:
             safe_type = re.sub(r"[^a-zA-Z0-9_]", "_", entity_type)
-            label_clause = f" SET n:`{safe_type}`"
+            label_clause = f", n:`{safe_type}`"
 
+        # NOTE: The OpenSearch graph plugin ignores plain ``SET`` after
+        # ``MERGE`` when the node already exists.  Use ``ON CREATE SET`` /
+        # ``ON MATCH SET`` to ensure properties are written in both cases.
         await self._execute_cypher(
             f"MERGE (n:Entity {{entity_id: $id}}) "
-            f"SET n += $props{label_clause}",
+            f"ON CREATE SET n += $props{label_clause} "
+            f"ON MATCH SET n += $props{label_clause}",
             {"id": node_id, "props": props},
         )
+
+        # Refresh the node index so subsequent MERGE calls (e.g. from the
+        # vector storage upsert that follows) can find this node.  Without
+        # this, concurrent async workers race on MERGE and create duplicates.
+        try:
+            node_index = f"{self._database_name}-lpg-nodes"
+            await self._client.indices.refresh(index=node_index)
+        except Exception:
+            pass
 
     async def upsert_edge(
         self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
@@ -1288,7 +1328,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             "WITH s "
             "MATCH (t:Entity {entity_id: $tgt}) "
             "MERGE (s)-[r:DIRECTED]->(t) "
-            "SET r += $props",
+            "ON CREATE SET r += $props "
+            "ON MATCH SET r += $props",
             {"src": source_node_id, "tgt": target_node_id, "props": props},
         )
 
@@ -1347,9 +1388,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 {"doc_id": doc_id},
             )
             chunk_ids = [
-                r["row"][0]
-                for r in resp.get("results", [{}])[0].get("data", [])
-                if r["row"][0]
+                r[0]
+                for r in self._cypher_rows(resp)
+                if r[0]
             ]
 
             if chunk_ids:
@@ -1387,9 +1428,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "MATCH (n:Entity) RETURN n.entity_id AS eid ORDER BY eid"
             )
             return [
-                r["row"][0]
-                for r in resp.get("results", [{}])[0].get("data", [])
-                if r["row"][0]
+                r[0]
+                for r in self._cypher_rows(resp)
+                if r[0]
             ]
         except Exception:
             return []
@@ -1498,11 +1539,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN n.entity_id AS eid, properties(n) AS props",
                 {"max": max_nodes},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
+            rows = self._cypher_rows(resp)
             node_ids = []
             for row in rows:
-                eid = row["row"][0]
-                props = row["row"][1] or {}
+                eid = row[0]
+                props = row[1] or {}
                 props.pop("embedding", None)
                 node_ids.append(eid)
                 result.nodes.append(self._construct_graph_node(eid, props))
@@ -1511,7 +1552,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             count_resp = await self._execute_cypher(
                 "MATCH (n:Entity) RETURN count(n) AS cnt"
             )
-            total = count_resp.get("results", [{}])[0].get("data", [{}])[0].get("row", [0])[0]
+            count_rows = self._cypher_rows(count_resp)
+            total = count_rows[0][0] if count_rows else 0
             result.is_truncated = total > max_nodes
 
             # Fetch edges between found nodes
@@ -1522,8 +1564,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
                     {"ids": node_ids},
                 )
-                for row in edge_resp.get("results", [{}])[0].get("data", []):
-                    src, tgt, props = row["row"][0], row["row"][1], row["row"][2] or {}
+                for row in self._cypher_rows(edge_resp):
+                    src, tgt, props = row[0], row[1], row[2] or {}
                     eid = f"{src}-{tgt}"
                     edge_data = {**props, "source_node_id": src, "target_node_id": tgt}
                     result.edges.append(self._construct_graph_edge(eid, edge_data))
@@ -1545,11 +1587,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             "RETURN node.entity_id AS eid, properties(node) AS props",
             {"id": start_label, "depth": max_depth, "max": max_nodes},
         )
-        rows = resp.get("results", [{}])[0].get("data", [])
+        rows = self._cypher_rows(resp)
         node_ids = []
         for row in rows:
-            eid = row["row"][0]
-            props = row["row"][1] or {}
+            eid = row[0]
+            props = row[1] or {}
             props.pop("embedding", None)
             if eid:
                 node_ids.append(eid)
@@ -1565,8 +1607,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
                 {"ids": node_ids},
             )
-            for row in edge_resp.get("results", [{}])[0].get("data", []):
-                src, tgt, props = row["row"][0], row["row"][1], row["row"][2] or {}
+            for row in self._cypher_rows(edge_resp):
+                src, tgt, props = row[0], row[1], row[2] or {}
                 eid = f"{src}-{tgt}"
                 edge_data = {**props, "source_node_id": src, "target_node_id": tgt}
                 result.edges.append(self._construct_graph_edge(eid, edge_data))
@@ -1587,11 +1629,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             "RETURN n.entity_id AS eid, properties(n) AS props",
             {"id": start_label, "max": max_nodes},
         )
-        rows = resp.get("results", [{}])[0].get("data", [])
+        rows = self._cypher_rows(resp)
         node_ids = []
         for row in rows:
-            eid = row["row"][0]
-            props = row["row"][1] or {}
+            eid = row[0]
+            props = row[1] or {}
             props.pop("embedding", None)
             if eid:
                 node_ids.append(eid)
@@ -1616,8 +1658,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
                 {"ids": node_ids},
             )
-            for row in edge_resp.get("results", [{}])[0].get("data", []):
-                src, tgt, props = row["row"][0], row["row"][1], row["row"][2] or {}
+            for row in self._cypher_rows(edge_resp):
+                src, tgt, props = row[0], row[1], row[2] or {}
                 eid = f"{src}-{tgt}"
                 edge_data = {**props, "source_node_id": src, "target_node_id": tgt}
                 result.edges.append(self._construct_graph_edge(eid, edge_data))
@@ -1633,10 +1675,10 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "MATCH (n:Entity) RETURN n.entity_id AS eid, properties(n) AS props"
             )
             nodes = []
-            for row in resp.get("results", [{}])[0].get("data", []):
-                props = row["row"][1] or {}
+            for row in self._cypher_rows(resp):
+                props = row[1] or {}
                 props.pop("embedding", None)
-                props["id"] = row["row"][0]
+                props["id"] = row[0]
                 nodes.append(props)
             return nodes
         except Exception:
@@ -1652,10 +1694,10 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props"
             )
             edges = []
-            for row in resp.get("results", [{}])[0].get("data", []):
-                props = row["row"][2] or {}
-                props["source"] = row["row"][0]
-                props["target"] = row["row"][1]
+            for row in self._cypher_rows(resp):
+                props = row[2] or {}
+                props["source"] = row[0]
+                props["target"] = row[1]
                 edges.append(props)
             return edges
         except Exception:
@@ -1674,9 +1716,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 {"limit": limit},
             )
             return [
-                r["row"][0]
-                for r in resp.get("results", [{}])[0].get("data", [])
-                if r["row"][0]
+                r[0]
+                for r in self._cypher_rows(resp)
+                if r[0]
             ]
         except Exception:
             return []
@@ -1694,9 +1736,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 {"q": query, "limit": limit},
             )
             return [
-                r["row"][0]
-                for r in resp.get("results", [{}])[0].get("data", [])
-                if r["row"][0]
+                r[0]
+                for r in self._cypher_rows(resp)
+                if r[0]
             ]
         except Exception:
             return []
@@ -2243,9 +2285,23 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
         pass
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        """Batch-embed and write nodes via Cypher UNWIND."""
+        """Batch-embed and write nodes via Cypher + OpenSearch bulk embedding update.
+
+        The graph plugin stores Cypher properties in a ``properties`` flat_object,
+        which serialises arrays to strings.  The top-level ``embedding`` knn_vector
+        field is separate and must be written via the OpenSearch document API.
+
+        Flow:
+        1. Cypher UNWIND MERGE — create/update node properties (no embedding).
+        2. Cypher RETURN — collect the internal node UUIDs (= OpenSearch ``_id``).
+        3. OpenSearch bulk script update — set the top-level ``embedding`` field.
+        """
         if not data:
             return
+
+        # Ensure graph database exists (may have been dropped).
+        gs = self._graph_storage
+        await gs._ensure_database_ready()
 
         logger.debug(
             f"[{self.workspace}] Upserting {len(data)} {self._node_label} nodes"
@@ -2268,8 +2324,12 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
         )
         embeddings = np.concatenate(embeddings_list)
 
-        # Build Cypher items
+        # Build Cypher items (no embedding — that goes via bulk update).
+        # NOTE: Properties are flattened into each item dict (not nested as
+        # ``item.props``) because the OpenSearch graph plugin's Cypher engine
+        # silently drops nested map values in ``SET n += item.props``.
         cypher_items = []
+        prop_keys: set[str] = set()
         for i, (doc_id, doc_data) in enumerate(items):
             props = {k: v for k, v in doc_data.items() if k in self.meta_fields}
             props["content"] = doc_data.get("content", "")
@@ -2277,31 +2337,43 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
             if self._node_label == "Entity":
                 entity_name = doc_data.get("entity_name", doc_id)
                 vdb_id = compute_mdhash_id(entity_name, prefix="ent-")
-                cypher_items.append({
-                    "merge_key_val": entity_name,
-                    "vdb_id": vdb_id,
-                    "props": props,
-                    "embedding": embeddings[i].tolist(),
-                })
+                item = {"merge_key_val": entity_name, "vdb_id": vdb_id}
+                item.update(props)
+                cypher_items.append(item)
             else:
                 # Chunk nodes: key = doc_id
-                cypher_items.append({
-                    "merge_key_val": doc_id,
-                    "props": props,
-                    "embedding": embeddings[i].tolist(),
-                })
+                item = {"merge_key_val": doc_id}
+                item.update(props)
+                cypher_items.append(item)
 
-        gs = self._graph_storage
+            prop_keys.update(props.keys())
+
+        # Build SET clause templates.  We use per-item non-UNWIND MERGE
+        # because the graph plugin's UNWIND + MERGE always creates new nodes
+        # (it lacks cross-row deduplication) and UNWIND + MATCH + SET silently
+        # drops the SET.  Per-item MERGE with ON CREATE/ON MATCH SET is the
+        # only reliable pattern.
+        set_parts = [f"n.{k} = ${k}" for k in sorted(prop_keys)]
+
+        # --- Step 1 + 2: per-item Cypher MERGE + collect UUIDs ---
+        node_uuids = []  # parallel to cypher_items
         if self._node_label == "Entity":
-            await gs._execute_cypher(
-                "UNWIND $items AS item "
-                "MERGE (n:Entity {entity_id: item.merge_key_val}) "
-                "SET n += item.props, n.embedding = item.embedding, "
-                "n.vdb_id = item.vdb_id",
-                {"items": cypher_items},
-            )
+            set_parts_entity = set_parts + ["n.vdb_id = $vdb_id"]
+            set_clause = ", ".join(set_parts_entity)
+            for item in cypher_items:
+                params = {k: v for k, v in item.items() if k != "merge_key_val"}
+                params["id"] = item["merge_key_val"]
+                resp = await gs._execute_cypher(
+                    "MERGE (n:Entity {entity_id: $id}) "
+                    f"ON CREATE SET {set_clause} "
+                    f"ON MATCH SET {set_clause} "
+                    "RETURN n",
+                    params,
+                )
+                for row in resp.get("data", []):
+                    node_uuids.append(row.get("n", ""))
+
             # Create MENTIONED_IN edges from entities to source chunks.
-            mentioned_items = []
             for _doc_id, doc_data in items:
                 entity_name = doc_data.get("entity_name", _doc_id)
                 source_id = doc_data.get("source_id", "")
@@ -2312,51 +2384,71 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                         if cid.strip()
                     ]
                     for cid in chunk_ids:
-                        mentioned_items.append({
-                            "entity_name": entity_name,
-                            "chunk_id": cid,
-                        })
-            if mentioned_items:
-                await gs._execute_cypher(
-                    "UNWIND $items AS item "
-                    "MATCH (e:Entity {entity_id: item.entity_name}) "
-                    "MATCH (c:Chunk {id: item.chunk_id}) "
-                    "MERGE (e)-[:MENTIONED_IN]->(c)",
-                    {"items": mentioned_items},
-                )
+                        await gs._execute_cypher(
+                            "MATCH (e:Entity {entity_id: $ename}) "
+                            "MATCH (c:Chunk {id: $cid}) "
+                            "MERGE (e)-[:MENTIONED_IN]->(c)",
+                            {"ename": entity_name, "cid": cid},
+                        )
         elif self._node_label == "Chunk":
-            await gs._execute_cypher(
-                "UNWIND $items AS item "
-                "MERGE (n:Chunk {id: item.merge_key_val}) "
-                "SET n += item.props, n.embedding = item.embedding",
-                {"items": cypher_items},
-            )
-            # Create PART_OF edges to Document nodes.
-            # Uses MERGE on Document to guarantee the node exists —
-            # avoids silently dropping chunk→document lineage.
-            part_of_items = []
-            for i, (doc_id, doc_data) in enumerate(items):
+            set_clause = ", ".join(set_parts) if set_parts else "n.content = $content"
+            for item in cypher_items:
+                params = {k: v for k, v in item.items() if k != "merge_key_val"}
+                params["id"] = item["merge_key_val"]
+                resp = await gs._execute_cypher(
+                    "MERGE (n:Chunk {id: $id}) "
+                    f"ON CREATE SET {set_clause} "
+                    f"ON MATCH SET {set_clause} "
+                    "RETURN n",
+                    params,
+                )
+                for row in resp.get("data", []):
+                    node_uuids.append(row.get("n", ""))
+
+            # Create PART_OF edges to Document nodes (per-item).
+            for _doc_id, doc_data in items:
                 full_doc_id = doc_data.get("full_doc_id")
                 if full_doc_id:
-                    part_of_items.append({
-                        "chunk_id": doc_id,
-                        "doc_id": full_doc_id,
-                        "file_path": doc_data.get("file_path", ""),
-                    })
-            if part_of_items:
-                await gs._execute_cypher(
-                    "UNWIND $items AS item "
-                    "MATCH (c:Chunk {id: item.chunk_id}) "
-                    "MERGE (d:Document {id: item.doc_id}) "
-                    "ON CREATE SET d.file_path = item.file_path "
-                    "MERGE (c)-[:PART_OF]->(d)",
-                    {"items": part_of_items},
-                )
+                    await gs._execute_cypher(
+                        "MATCH (c:Chunk {id: $cid}) "
+                        "MERGE (d:Document {id: $did}) "
+                        "ON CREATE SET d.file_path = $fp "
+                        "ON MATCH SET d.file_path = $fp "
+                        "MERGE (c)-[:PART_OF]->(d)",
+                        {
+                            "cid": _doc_id,
+                            "did": full_doc_id,
+                            "fp": doc_data.get("file_path", ""),
+                        },
+                    )
+
+        # --- Step 3: Bulk-update top-level embedding via OpenSearch ---
+        if node_uuids:
+            node_index = f"{gs.database_name}-lpg-nodes"
+            actions = []
+            for idx, uuid in enumerate(node_uuids):
+                if not uuid or idx >= len(embeddings):
+                    continue
+                actions.append({"update": {"_index": node_index, "_id": uuid}})
+                actions.append({
+                    "script": {
+                        "source": "ctx._source.embedding = params.embedding",
+                        "params": {"embedding": embeddings[idx].tolist()},
+                    }
+                })
+            if actions:
+                body = "\n".join(
+                    json_module.dumps(a) for a in actions
+                ) + "\n"
+                await self._client.bulk(body=body, refresh="false")
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
         """Hybrid retrieval via ``POST _plugins/_graph/retrieve``."""
+        gs = self._graph_storage
+        await gs._ensure_database_ready()
+
         if query_embedding is not None:
             query_vector = (
                 query_embedding.tolist()
@@ -2366,8 +2458,6 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
         else:
             embedding = await self.embedding_func([query], _priority=5)
             query_vector = embedding[0].tolist()
-
-        gs = self._graph_storage
         retrieve_body = {
             "query_text": query,
             "query_vector": query_vector,
@@ -2392,25 +2482,36 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
 
         results = []
         for r in resp.get("results", []):
-            props = r.get("properties", {})
+            raw_props = r.get("properties", {})
             score = r.get("score", 0.0)
             if score < self.hybrid_score_threshold:
                 continue
 
+            # Hybrid retrieval returns property keys with a "properties."
+            # prefix (e.g., "properties.entity_id").  Strip the prefix so
+            # downstream code sees plain keys.
+            props = {}
+            for k, v in raw_props.items():
+                clean_key = k.removeprefix("properties.")
+                if clean_key.startswith("__"):
+                    continue  # skip internal keys like __labels
+                props[clean_key] = v
+
             if self._node_label == "Entity":
+                entity_name = props.get("entity_id", "")
                 doc = {
-                    "id": props.get("vdb_id", r.get("node_id", "")),
-                    "entity_name": r.get("node_id", ""),
+                    "id": props.get("vdb_id", ""),
+                    "entity_name": entity_name,
                     "distance": score,
                 }
             else:
                 doc = {
-                    "id": r.get("node_id", ""),
+                    "id": props.get("id", r.get("node_id", "")),
                     "distance": score,
                 }
             # Merge all properties
             for k, v in props.items():
-                if k not in ("embedding", "vdb_id"):
+                if k not in ("embedding", "vdb_id", "id"):
                     doc.setdefault(k, v)
             results.append(doc)
 
@@ -2466,9 +2567,9 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                 f"RETURN properties(n) AS props",
                 {"id": id},
             )
-            rows = resp.get("results", [{}])[0].get("data", [])
+            rows = gs._cypher_rows(resp)
             if rows:
-                props = rows[0].get("row", [None])[0]
+                props = rows[0][0]
                 if props:
                     props.pop("embedding", None)
                     props["id"] = id
@@ -2490,9 +2591,9 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                 {"ids": ids},
             )
             result_map = {}
-            for row in resp.get("results", [{}])[0].get("data", []):
-                key = row["row"][0]
-                props = row["row"][1] or {}
+            for row in gs._cypher_rows(resp):
+                key = row[0]
+                props = row[1] or {}
                 props.pop("embedding", None)
                 props["id"] = key
                 result_map[key] = props
@@ -2513,9 +2614,9 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                 {"ids": ids},
             )
             result = {}
-            for row in resp.get("results", [{}])[0].get("data", []):
-                key = row["row"][0]
-                emb = row["row"][1]
+            for row in gs._cypher_rows(resp):
+                key = row[0]
+                emb = row[1]
                 if emb:
                     result[key] = emb
             return result
@@ -2635,10 +2736,10 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
         # Step 3: Transform to relationship vector store format
         results = []
         seen = set()
-        for row in resp.get("results", [{}])[0].get("data", []):
-            src = row["row"][0]
-            tgt = row["row"][1]
-            props = row["row"][2] or {}
+        for row in gs._cypher_rows(resp):
+            src = row[0]
+            tgt = row[1]
+            props = row[2] or {}
 
             # Canonicalize endpoint order so the same edge always
             # produces the same id, src_id, tgt_id regardless of which
@@ -2732,10 +2833,10 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
             return {"data": []}
 
         records = []
-        for row in resp.get("results", [{}])[0].get("data", []):
-            src = row["row"][0]
-            tgt = row["row"][1]
-            props = row["row"][2] or {}
+        for row in gs._cypher_rows(resp):
+            src = row[0]
+            tgt = row[1]
+            props = row[2] or {}
             canon_src, canon_tgt = sorted([src, tgt])
             rel_id = compute_mdhash_id(canon_src + canon_tgt, prefix="rel-")
             records.append({

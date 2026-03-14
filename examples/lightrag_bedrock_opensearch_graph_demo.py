@@ -62,7 +62,7 @@ WORKING_DIR = "./opensearch_bedrock_rag_storage"
 BOOK_FILE = "./book.txt"
 
 # Bedrock model IDs
-LLM_MODEL = os.environ.get("BEDROCK_LLM_MODEL", "anthropic.claude-opus-4-6-v1:0")
+LLM_MODEL = os.environ.get("BEDROCK_LLM_MODEL", "us.anthropic.claude-opus-4-6-v1")
 EMBEDDING_MODEL = os.environ.get("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
 
 # Titan Embed v2 produces 1024-dimensional vectors

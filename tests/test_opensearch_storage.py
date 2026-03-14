@@ -951,10 +951,26 @@ class TestDatabaseNameSanitization:
 
 
 def _cypher_response(data=None, columns=None):
-    """Build a mock Cypher endpoint response."""
+    """Build a mock Cypher endpoint response.
+
+    The OpenSearch graph plugin Cypher endpoint returns:
+    ``{"columns": ["a","b"], "data": [{"a": 1, "b": 2}, ...]}``
+
+    For convenience, callers can pass ``[{"row": [v1, v2]}]`` style data
+    and this helper converts it to the graph plugin format using the
+    provided columns list.
+    """
     if data is None:
         data = []
-    return {"results": [{"columns": columns or [], "data": data}]}
+    cols = columns or []
+    # Convert old {"row": [...]} format to graph plugin format
+    converted = []
+    for item in data:
+        if "row" in item:
+            converted.append(dict(zip(cols, item["row"])))
+        else:
+            converted.append(item)
+    return {"columns": cols, "data": converted}
 
 
 class TestGraphStorage:
@@ -1782,10 +1798,11 @@ class TestGraphVectorStorage:
             "ent-abc": {"content": "Alice is a researcher", "entity_name": "ALICE"},
             "ent-def": {"content": "Bob is an engineer", "entity_name": "BOB"},
         })
-        # Verify Cypher was called with UNWIND MERGE
+        # Verify Cypher MERGE was called (per-item, not UNWIND)
         calls = mock_client.transport.perform_request.call_args_list
         cypher_calls = [c for c in calls if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"]
-        assert len(cypher_calls) >= 1
+        # 2 entities → 2 per-item MERGE calls
+        assert len(cypher_calls) >= 2
 
     @pytest.mark.asyncio
     async def test_upsert_entity_creates_mentioned_in_edges(
@@ -1807,11 +1824,13 @@ class TestGraphVectorStorage:
         mentioned_calls = [
             c for c in cypher_calls if "MENTIONED_IN" in str(c)
         ]
-        assert len(mentioned_calls) == 1, "Should create MENTIONED_IN edges"
-        # Verify the items contain the right chunk IDs
-        body = mentioned_calls[0].kwargs.get("body", {})
-        items = body.get("parameters", {}).get("items", [])
-        chunk_ids = sorted(item["chunk_id"] for item in items)
+        # Per-item Cypher: one call per chunk_id (source_id has 2 chunks)
+        assert len(mentioned_calls) == 2, "Should create MENTIONED_IN edges"
+        # Verify each call has the right parameters
+        chunk_ids = sorted(
+            c.kwargs.get("body", {}).get("parameters", {}).get("cid", "")
+            for c in mentioned_calls
+        )
         assert chunk_ids == ["chunk-1", "chunk-2"]
 
     @pytest.mark.asyncio
@@ -1882,20 +1901,24 @@ class TestGraphVectorStorage:
             return_value={
                 "results": [
                     {
-                        "node_id": "ALICE",
+                        "node_id": "uuid-alice-001",
                         "score": 0.9,
                         "properties": {
-                            "vdb_id": "ent-abc",
-                            "content": "Alice is a researcher",
-                            "entity_name": "ALICE",
+                            "properties.entity_id": "ALICE",
+                            "properties.vdb_id": "ent-abc",
+                            "properties.content": "Alice is a researcher",
+                            "properties.entity_name": "ALICE",
+                            "__labels": '["Entity"]',
                         },
                     },
                     {
-                        "node_id": "BOB",
+                        "node_id": "uuid-bob-001",
                         "score": 0.1,  # Below hybrid_score_threshold
                         "properties": {
-                            "vdb_id": "ent-def",
-                            "content": "Bob",
+                            "properties.entity_id": "BOB",
+                            "properties.vdb_id": "ent-def",
+                            "properties.content": "Bob",
+                            "__labels": '["Entity"]',
                         },
                     },
                 ]
@@ -1921,14 +1944,24 @@ class TestGraphVectorStorage:
             return_value={
                 "results": [
                     {
-                        "node_id": "ALICE",
+                        "node_id": "uuid-alice-002",
                         "score": 0.9,
-                        "properties": {"vdb_id": "ent-abc", "content": "Alice"},
+                        "properties": {
+                            "properties.entity_id": "ALICE",
+                            "properties.vdb_id": "ent-abc",
+                            "properties.content": "Alice",
+                            "__labels": '["Entity"]',
+                        },
                     },
                     {
-                        "node_id": "BOB",
+                        "node_id": "uuid-bob-002",
                         "score": 0.05,
-                        "properties": {"vdb_id": "ent-def", "content": "Bob"},
+                        "properties": {
+                            "properties.entity_id": "BOB",
+                            "properties.vdb_id": "ent-def",
+                            "properties.content": "Bob",
+                            "__labels": '["Entity"]',
+                        },
                     },
                 ]
             }
@@ -2033,14 +2066,26 @@ class TestRelationshipAdapter:
         retrieve_resp = {
             "results": [
                 {
-                    "node_id": "ALICE",
+                    "node_id": "uuid-alice-003",
                     "score": 0.9,
-                    "properties": {"vdb_id": "ent-a", "content": "Alice", "entity_name": "ALICE"},
+                    "properties": {
+                        "properties.entity_id": "ALICE",
+                        "properties.vdb_id": "ent-a",
+                        "properties.content": "Alice",
+                        "properties.entity_name": "ALICE",
+                        "__labels": '["Entity"]',
+                    },
                 },
                 {
-                    "node_id": "BOB",
+                    "node_id": "uuid-bob-003",
                     "score": 0.8,
-                    "properties": {"vdb_id": "ent-b", "content": "Bob", "entity_name": "BOB"},
+                    "properties": {
+                        "properties.entity_id": "BOB",
+                        "properties.vdb_id": "ent-b",
+                        "properties.content": "Bob",
+                        "properties.entity_name": "BOB",
+                        "__labels": '["Entity"]',
+                    },
                 },
             ]
         }
@@ -2078,10 +2123,22 @@ class TestRelationshipAdapter:
         """Edge returned as (BOB, ALICE) should produce same id as (ALICE, BOB)."""
         retrieve_resp = {
             "results": [
-                {"node_id": "ALICE", "score": 0.9,
-                 "properties": {"vdb_id": "ent-a", "content": "Alice", "entity_name": "ALICE"}},
-                {"node_id": "BOB", "score": 0.8,
-                 "properties": {"vdb_id": "ent-b", "content": "Bob", "entity_name": "BOB"}},
+                {"node_id": "uuid-alice-004", "score": 0.9,
+                 "properties": {
+                     "properties.entity_id": "ALICE",
+                     "properties.vdb_id": "ent-a",
+                     "properties.content": "Alice",
+                     "properties.entity_name": "ALICE",
+                     "__labels": '["Entity"]',
+                 }},
+                {"node_id": "uuid-bob-004", "score": 0.8,
+                 "properties": {
+                     "properties.entity_id": "BOB",
+                     "properties.vdb_id": "ent-b",
+                     "properties.content": "Bob",
+                     "properties.entity_name": "BOB",
+                     "__labels": '["Entity"]',
+                 }},
             ]
         }
         # Return edge in REVERSED order: BOB→ALICE
