@@ -652,24 +652,73 @@ class LightRAG:
             embedding_func=self.embedding_func,
         )
 
-        self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=NameSpace.VECTOR_STORE_ENTITIES,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
-        )
-        self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-            meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
-        )
-        self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=NameSpace.VECTOR_STORE_CHUNKS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
-        )
+        # Check if graph plugin provides implicit vector storage
+        _use_graph_plugin_vdb = False
+        try:
+            from lightrag.kg.opensearch_impl import (
+                OpenSearchGraphStorage as _OSGraphStorage,
+                OpenSearchGraphVectorStorage as _OSGraphVectorStorage,
+                OpenSearchGraphRelationshipAdapter as _OSGraphRelAdapter,
+            )
+            if isinstance(self.chunk_entity_relation_graph, _OSGraphStorage):
+                _use_graph_plugin_vdb = True
+                if self.vector_storage != "OpenSearchGraphVectorStorage":
+                    logger.info(
+                        f"Ignoring vector_storage={self.vector_storage!r}; "
+                        "graph plugin provides implicit vector storage"
+                    )
+        except ImportError:
+            pass
+
+        if _use_graph_plugin_vdb:
+            graph_db = self.chunk_entity_relation_graph
+            self.entities_vdb: BaseVectorStorage = _OSGraphVectorStorage(
+                namespace=NameSpace.VECTOR_STORE_ENTITIES,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"entity_name", "source_id", "content", "file_path"},
+                node_label="Entity",
+                key_property="vdb_id",
+                merge_key="entity_id",
+                graph_storage=graph_db,
+            )
+            self.chunks_vdb: BaseVectorStorage = _OSGraphVectorStorage(
+                namespace=NameSpace.VECTOR_STORE_CHUNKS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"full_doc_id", "content", "file_path"},
+                node_label="Chunk",
+                key_property="id",
+                merge_key="id",
+                graph_storage=graph_db,
+            )
+            self.relationships_vdb: BaseVectorStorage = _OSGraphRelAdapter(
+                namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+                entities_vdb=self.entities_vdb,
+                graph_storage=graph_db,
+            )
+        else:
+            self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+                namespace=NameSpace.VECTOR_STORE_ENTITIES,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"entity_name", "source_id", "content", "file_path"},
+            )
+            self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+                namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+            )
+            self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+                namespace=NameSpace.VECTOR_STORE_CHUNKS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"full_doc_id", "content", "file_path"},
+            )
 
         # Initialize document status storage
         self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
@@ -723,11 +772,11 @@ class LightRAG:
                 self.full_relations,
                 self.entity_chunks,
                 self.relation_chunks,
+                self.llm_response_cache,
+                self.chunk_entity_relation_graph,  # Graph storage before vector stores
                 self.entities_vdb,
                 self.relationships_vdb,
                 self.chunks_vdb,
-                self.chunk_entity_relation_graph,
-                self.llm_response_cache,
                 self.doc_status,
             ):
                 if storage:

@@ -5,6 +5,8 @@ All tests use mocks — no running OpenSearch instance required.
 Run with: pytest tests/test_opensearch_storage.py -v
 """
 
+import re
+
 import pytest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
@@ -16,12 +18,16 @@ from lightrag.kg.opensearch_impl import (
     OpenSearchDocStatusStorage,
     OpenSearchGraphStorage,
     OpenSearchVectorDBStorage,
+    OpenSearchGraphVectorStorage,
+    OpenSearchGraphRelationshipAdapter,
     ClientManager,
     _build_index_name,
     _resolve_workspace,
     _sanitize_index_name,
+    _sanitize_database_name,
 )
 from lightrag.base import DocStatus, DocProcessingStatus
+from lightrag.utils import compute_mdhash_id
 
 
 # ---------------------------------------------------------------------------
@@ -900,12 +906,59 @@ class TestDocStatusStorage:
 
 
 # ---------------------------------------------------------------------------
-# Graph Storage
+# Database Name Sanitization
 # ---------------------------------------------------------------------------
 
 
+class TestDatabaseNameSanitization:
+    """Tests for _sanitize_database_name helper."""
+
+    def test_basic(self):
+        name = _sanitize_database_name("myws", "lightrag")
+        assert name.startswith("myws_lightrag-")
+        assert len(name) <= 200
+
+    def test_special_chars(self):
+        name = _sanitize_database_name("My Project!", "light/rag")
+        assert re.match(r"^[a-z][a-z0-9_-]*$", name)
+
+    def test_unicode(self):
+        name = _sanitize_database_name("日本語", "namespace")
+        assert re.match(r"^[a-z][a-z0-9_-]*$", name)
+
+    def test_digit_prefix(self):
+        name = _sanitize_database_name("123start", "ns")
+        assert name[0] == "g"
+
+    def test_long_name_truncated(self):
+        name = _sanitize_database_name("a" * 200, "b" * 200)
+        assert len(name) <= 200
+
+    def test_collision_safety(self):
+        n1 = _sanitize_database_name("workspace_a", "ns")
+        n2 = _sanitize_database_name("workspace-a", "ns")
+        # Different inputs produce different hash suffixes
+        assert n1 != n2
+
+    def test_empty_workspace(self):
+        name = _sanitize_database_name("", "ns")
+        assert re.match(r"^[a-z][a-z0-9_-]*$", name)
+
+
+# ---------------------------------------------------------------------------
+# Graph Storage (Cypher-based)
+# ---------------------------------------------------------------------------
+
+
+def _cypher_response(data=None, columns=None):
+    """Build a mock Cypher endpoint response."""
+    if data is None:
+        data = []
+    return {"results": [{"columns": columns or [], "data": data}]}
+
+
 class TestGraphStorage:
-    """Tests for OpenSearchGraphStorage node/edge CRUD, batch ops, BFS, and label queries."""
+    """Tests for Cypher-based OpenSearchGraphStorage."""
 
     def _make(self, global_config, embed_func, workspace="test"):
         return OpenSearchGraphStorage(
@@ -916,23 +969,32 @@ class TestGraphStorage:
         )
 
     @pytest.mark.asyncio
-    async def test_index_names(self, global_config, embed_func):
+    async def test_database_name(self, global_config, embed_func):
         s = self._make(global_config, embed_func)
-        assert s._nodes_index == "test_chunk_entity_relation-nodes"
-        assert s._edges_index == "test_chunk_entity_relation-edges"
+        assert s.database_name.startswith("test_chunk_entity_relation-")
+        assert len(s.database_name) <= 200
 
     @pytest.mark.asyncio
-    async def test_initialize_creates_both_indices(
+    async def test_initialize_creates_database(
         self, global_config, embed_func, mock_client
     ):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
-            assert mock_client.indices.create.await_count == 2
+            # Should have called PUT to create the database
+            calls = mock_client.transport.perform_request.call_args_list
+            put_calls = [c for c in calls if c[0][0] == "PUT"]
+            assert len(put_calls) >= 1
+            assert "_plugins/_graph/database/" in put_calls[0][0][1]
 
     @pytest.mark.asyncio
     async def test_has_node_true(self, global_config, embed_func, mock_client):
-        mock_client.exists = AsyncMock(return_value=True)
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": [True]}], ["exists"]
+            )
+        )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
@@ -940,7 +1002,11 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_has_node_false(self, global_config, embed_func, mock_client):
-        mock_client.exists = AsyncMock(return_value=False)
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": [False]}], ["exists"]
+            )
+        )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
@@ -948,17 +1014,10 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_has_edge(self, global_config, embed_func, mock_client):
-        mock_client.search = AsyncMock(
-            return_value={
-                "hits": {"hits": [], "total": {"value": 1}},
-                "aggregations": {
-                    "status_counts": {"buckets": []},
-                    "src": {"buckets": []},
-                    "tgt": {"buckets": []},
-                    "source_degrees": {"buckets": []},
-                    "target_degrees": {"buckets": []},
-                },
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": [True]}], ["exists"]
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
@@ -967,7 +1026,11 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_node_degree(self, global_config, embed_func, mock_client):
-        mock_client.count = AsyncMock(return_value={"count": 3})
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": [3]}], ["degree"]
+            )
+        )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
@@ -975,66 +1038,35 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_get_node(self, global_config, embed_func, mock_client):
-        mock_client.mget = AsyncMock(
-            return_value={
-                "docs": [
-                    {
-                        "_id": "Alice",
-                        "found": True,
-                        "_source": {
-                            "entity_type": "person",
-                            "description": "A researcher",
-                        },
-                    }
-                ]
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": [{"entity_id": "Alice", "entity_type": "person", "description": "A researcher"}]}],
+                ["props"],
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             node = await s.get_node("Alice")
             assert node["entity_type"] == "person"
-            assert node["_id"] == "Alice"
-            mock_client.mget.assert_awaited_once_with(
-                index=s._nodes_index, body={"ids": ["Alice"]}
-            )
 
     @pytest.mark.asyncio
     async def test_get_node_not_found(self, global_config, embed_func, mock_client):
-        mock_client.mget = AsyncMock(
-            return_value={"docs": [{"_id": "Nobody", "found": False}]}
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response([], ["props"])
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             assert await s.get_node("Nobody") is None
-            mock_client.get.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_get_edge(self, global_config, embed_func, mock_client):
-        mock_client.search = AsyncMock(
-            return_value={
-                "hits": {
-                    "hits": [
-                        {
-                            "_id": "e1",
-                            "_source": {
-                                "source_node_id": "A",
-                                "target_node_id": "B",
-                                "weight": 1.0,
-                            },
-                        },
-                    ],
-                    "total": {"value": 1},
-                },
-                "aggregations": {
-                    "status_counts": {"buckets": []},
-                    "src": {"buckets": []},
-                    "tgt": {"buckets": []},
-                    "source_degrees": {"buckets": []},
-                    "target_degrees": {"buckets": []},
-                },
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": [{"weight": 1.0, "description": "knows"}]}],
+                ["props"],
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
@@ -1045,24 +1077,11 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_get_node_edges(self, global_config, embed_func, mock_client):
-        mock_client.search = AsyncMock(
-            return_value={
-                "hits": {
-                    "hits": [
-                        {
-                            "_id": "e1",
-                            "_source": {"source_node_id": "A", "target_node_id": "B"},
-                            "sort": [1],
-                        },
-                        {
-                            "_id": "e2",
-                            "_source": {"source_node_id": "C", "target_node_id": "A"},
-                            "sort": [2],
-                        },
-                    ],
-                    "total": {"value": 2},
-                },
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": ["A", "B"]}, {"row": ["A", "C"]}],
+                ["src", "tgt"],
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
@@ -1073,13 +1092,11 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_get_nodes_batch(self, global_config, embed_func, mock_client):
-        mock_client.mget = AsyncMock(
-            return_value={
-                "docs": [
-                    {"_id": "A", "found": True, "_source": {"entity_type": "person"}},
-                    {"_id": "B", "found": False},
-                ]
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": ["A", {"entity_type": "person"}]}],
+                ["eid", "props"],
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
@@ -1090,193 +1107,121 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_node_degrees_batch(self, global_config, embed_func, mock_client):
-        mock_client.search = AsyncMock(
-            return_value={
-                "hits": {"hits": [], "total": {"value": 0}},
-                "aggregations": {
-                    "source_degrees": {"buckets": [{"key": "A", "doc_count": 2}]},
-                    "target_degrees": {
-                        "buckets": [
-                            {"key": "A", "doc_count": 1},
-                            {"key": "B", "doc_count": 3},
-                        ]
-                    },
-                    "status_counts": {"buckets": []},
-                    "src": {"buckets": []},
-                    "tgt": {"buckets": []},
-                },
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": ["A", 3]}, {"row": ["B", 5]}],
+                ["eid", "degree"],
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             degrees = await s.node_degrees_batch(["A", "B"])
-            assert degrees["A"] == 3  # 2 + 1
-            assert degrees["B"] == 3
+            assert degrees["A"] == 3
+            assert degrees["B"] == 5
 
     @pytest.mark.asyncio
     async def test_upsert_node(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             await s.upsert_node(
                 "Alice", {"entity_type": "person", "source_id": "c1<SEP>c2"}
             )
-            mock_client.index.assert_awaited()
-            call_kwargs = mock_client.index.call_args
-            assert call_kwargs.kwargs["id"] == "Alice"
-            body = call_kwargs.kwargs["body"]
-            assert body["source_ids"] == ["c1", "c2"]
-            assert body["entity_id"] == "Alice"
+            # Verify Cypher was called with MERGE
+            calls = mock_client.transport.perform_request.call_args_list
+            cypher_calls = [
+                c for c in calls
+                if c[0][1] == "/_plugins/_cypher"
+            ]
+            assert len(cypher_calls) >= 1
+            body = cypher_calls[-1][1].get("body") or cypher_calls[-1][0][2] if len(cypher_calls[-1][0]) > 2 else cypher_calls[-1].kwargs.get("body", {})
+            if isinstance(body, dict):
+                assert "MERGE" in body.get("query", "")
 
     @pytest.mark.asyncio
     async def test_upsert_edge(self, global_config, embed_func, mock_client):
-        mock_client.exists = AsyncMock(return_value=False)
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             await s.upsert_edge("A", "B", {"weight": "1.0", "description": "knows"})
-            # Should call index twice: once for ensuring source node, once for edge
-            assert mock_client.index.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_upsert_after_drop_recreates_indices(
-        self, global_config, embed_func, mock_client
-    ):
-        mock_client.exists = AsyncMock(return_value=False)
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            with patch.object(
-                s, "_create_indices_if_not_exist", new_callable=AsyncMock
-            ) as mock_create:
-                await s.initialize()
-                mock_create.reset_mock()
-                await s.drop()
-                await s.upsert_edge("A", "B", {"weight": "1.0"})
-                mock_create.assert_awaited_once()
-                assert mock_client.index.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_reads_short_circuit_after_drop(
-        self, global_config, embed_func, mock_client
-    ):
-        mock_client.transport = AsyncMock()
-        mock_client.transport.perform_request = AsyncMock(
-            side_effect=Exception("PPL not available")
-        )
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            await s.drop()
-
-            graph = await s.get_knowledge_graph("A", max_depth=2)
-
-            assert await s.get_node("A") is None
-            assert await s.get_all_labels() == []
-            assert await s.has_edge("A", "B") is False
-            assert await s.node_degree("A") == 0
-            assert len(graph.nodes) == 0
-            assert len(graph.edges) == 0
-
-            mock_client.mget.assert_not_awaited()
-            mock_client.search.assert_not_awaited()
-            mock_client.create_pit.assert_not_awaited()
-            mock_client.count.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_read_missing_index_demotes_readiness(
-        self, global_config, embed_func, mock_client
-    ):
-        mock_client.transport = AsyncMock()
-        mock_client.transport.perform_request = AsyncMock(
-            side_effect=Exception("PPL not available")
-        )
-        mock_client.mget = AsyncMock(side_effect=_missing_index_error())
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-
-            assert await s.get_node("A") is None
-            assert await s.get_node("A") is None
-            assert s._indices_ready is False
-            assert mock_client.mget.await_count == 1
+            # Verify a Cypher call with MERGE was made
+            calls = mock_client.transport.perform_request.call_args_list
+            cypher_calls = [
+                c for c in calls
+                if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"
+            ]
+            assert len(cypher_calls) >= 1
 
     @pytest.mark.asyncio
     async def test_delete_node(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             await s.delete_node("Alice")
-            mock_client.delete_by_query.assert_awaited_once()
-            mock_client.delete.assert_awaited_once()
+            # Verify Cypher DETACH DELETE was called
+            calls = mock_client.transport.perform_request.call_args_list
+            cypher_calls = [
+                c for c in calls
+                if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"
+            ]
+            found_detach = any(
+                "DETACH DELETE" in str(c)
+                for c in cypher_calls
+            )
+            assert found_detach
 
     @pytest.mark.asyncio
     async def test_remove_nodes(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
-            with patch(
-                "lightrag.kg.opensearch_impl.helpers.async_bulk", new_callable=AsyncMock
-            ) as mock_bulk:
-                mock_bulk.return_value = (2, [])
-                s = self._make(global_config, embed_func)
-                await s.initialize()
-                await s.remove_nodes(["A", "B"])
-                mock_client.delete_by_query.assert_awaited_once()
-                mock_bulk.assert_awaited_once()
+            s = self._make(global_config, embed_func)
+            await s.initialize()
+            await s.remove_nodes(["A", "B"])
 
     @pytest.mark.asyncio
     async def test_remove_edges(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             await s.remove_edges([("A", "B"), ("C", "D")])
-            mock_client.delete_by_query.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_get_all_labels(self, global_config, embed_func, mock_client):
-        mock_client.search = AsyncMock(
-            return_value={
-                "hits": {
-                    "hits": [
-                        {"_id": "Alice", "sort": ["Alice"]},
-                        {"_id": "Bob", "sort": ["Bob"]},
-                    ],
-                    "total": {"value": 2},
-                },
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": ["Alice"]}, {"row": ["Bob"]}], ["eid"]
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             labels = await s.get_all_labels()
-            assert labels == ["Alice", "Bob"]
+            assert "Alice" in labels
+            assert "Bob" in labels
 
     @pytest.mark.asyncio
     async def test_get_popular_labels(self, global_config, embed_func, mock_client):
-        mock_client.search = AsyncMock(
-            return_value={
-                "hits": {"hits": [], "total": {"value": 0}},
-                "aggregations": {
-                    "src": {
-                        "buckets": [
-                            {"key": "A", "doc_count": 5},
-                            {"key": "B", "doc_count": 2},
-                        ]
-                    },
-                    "tgt": {"buckets": [{"key": "A", "doc_count": 3}]},
-                    "status_counts": {"buckets": []},
-                },
-            }
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": ["A"]}, {"row": ["B"]}], ["eid"]
+            )
         )
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             labels = await s.get_popular_labels(limit=10)
-            assert labels[0] == "A"  # degree 8 > B degree 2
+            assert labels[0] == "A"
 
     @pytest.mark.asyncio
     async def test_search_labels_empty_query(
         self, global_config, embed_func, mock_client
     ):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
@@ -1284,47 +1229,29 @@ class TestGraphStorage:
 
     @pytest.mark.asyncio
     async def test_drop(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
             result = await s.drop()
             assert result["status"] == "success"
-            assert mock_client.indices.delete.await_count == 2
+            # Verify DELETE was called on the database
+            calls = mock_client.transport.perform_request.call_args_list
+            delete_calls = [c for c in calls if c[0][0] == "DELETE"]
+            assert len(delete_calls) >= 1
 
     @pytest.mark.asyncio
-    async def test_drop_partial_error_marks_indices_not_ready_and_next_upsert_recreates_indices(
+    async def test_reads_short_circuit_after_drop(
         self, global_config, embed_func, mock_client
     ):
-        mock_client.exists = AsyncMock(return_value=False)
-        mock_client.indices.delete = AsyncMock(
-            side_effect=[None, OpenSearchException("edges drop failed")]
-        )
+        mock_client.transport.perform_request = AsyncMock(return_value={})
         with patch.object(ClientManager, "get_client", return_value=mock_client):
             s = self._make(global_config, embed_func)
             await s.initialize()
-            with patch.object(
-                s, "_create_indices_if_not_exist", new_callable=AsyncMock
-            ) as mock_create:
-                result = await s.drop()
-                assert result["status"] == "error"
-                assert "edges drop failed" in result["message"]
-                assert s._indices_ready is False
-                await s.upsert_edge("A", "B", {"weight": "1.0"})
-                mock_create.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_drop_treats_missing_graph_indices_as_success(
-        self, global_config, embed_func, mock_client
-    ):
-        mock_client.indices.delete = AsyncMock(
-            side_effect=[_missing_index_error(), _missing_index_error()]
-        )
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            result = await s.drop()
-            assert result["status"] == "success"
-            assert s._indices_ready is False
+            await s.drop()
+            assert await s.has_node("A") is False
+            assert await s.get_all_labels() == []
+            assert await s.node_degree("A") == 0
 
     @pytest.mark.asyncio
     async def test_construct_graph_node(self, global_config, embed_func):
@@ -1336,12 +1263,14 @@ class TestGraphStorage:
                 "description": "A researcher",
                 "_id": "Alice",
                 "entity_id": "Alice",
+                "embedding": [0.1, 0.2],
             },
         )
         assert node.id == "Alice"
         assert "entity_type" in node.properties
         assert "_id" not in node.properties
         assert "entity_id" not in node.properties
+        assert "embedding" not in node.properties
 
     @pytest.mark.asyncio
     async def test_construct_graph_edge(self, global_config, embed_func):
@@ -1361,293 +1290,10 @@ class TestGraphStorage:
         assert "source_node_id" not in edge.properties
 
     @pytest.mark.asyncio
-    async def test_bfs_subgraph_start_not_found(
-        self, global_config, embed_func, mock_client
-    ):
-        mock_client.mget = AsyncMock(
-            return_value={"docs": [{"_id": "NonExistent", "found": False}]}
-        )
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            result = await s.get_knowledge_graph("NonExistent", max_depth=2)
-            assert len(result.nodes) == 0
-            assert len(result.edges) == 0
-
-
-class TestGraphPPLDetection:
-    """Tests for PPL graphlookup detection and server-side BFS."""
-
-    def _make(self, global_config, embed_func, workspace="test"):
-        return OpenSearchGraphStorage(
-            namespace="chunk_entity_relation",
-            global_config=global_config,
-            embedding_func=embed_func,
-            workspace=workspace,
-        )
-
-    @pytest.mark.asyncio
-    async def test_ppl_detected_when_available(
-        self, global_config, embed_func, mock_client
-    ):
-        """When PPL endpoint responds successfully, graphlookup should be detected."""
-        mock_client.transport = AsyncMock()
-        mock_client.transport.perform_request = AsyncMock(
-            return_value={"datarows": [], "schema": []}
-        )
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            assert s._ppl_graphlookup_available is True
-
-    @pytest.mark.asyncio
-    async def test_ppl_not_detected_when_endpoint_fails(
-        self, global_config, embed_func, mock_client
-    ):
-        """When PPL endpoint fails, should fall back to client-side BFS."""
-        mock_client.transport = AsyncMock()
-        mock_client.transport.perform_request = AsyncMock(
-            side_effect=Exception("PPL not supported")
-        )
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            assert s._ppl_graphlookup_available is False
-
-    @pytest.mark.asyncio
-    async def test_env_override_true(self, global_config, embed_func, mock_client):
-        with patch.dict("os.environ", {"OPENSEARCH_USE_PPL_GRAPHLOOKUP": "true"}):
-            with patch.object(ClientManager, "get_client", return_value=mock_client):
-                s = self._make(global_config, embed_func)
-                await s.initialize()
-                assert s._ppl_graphlookup_available is True
-                # Should NOT have called transport.perform_request for detection
-                mock_client.transport.perform_request.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_env_override_false(self, global_config, embed_func, mock_client):
-        mock_client.transport = AsyncMock()
-        mock_client.transport.perform_request = AsyncMock(
-            return_value={"datarows": [], "schema": []}
-        )
-        with patch.dict("os.environ", {"OPENSEARCH_USE_PPL_GRAPHLOOKUP": "false"}):
-            with patch.object(ClientManager, "get_client", return_value=mock_client):
-                s = self._make(global_config, embed_func)
-                await s.initialize()
-                assert s._ppl_graphlookup_available is False
-
-    @pytest.mark.asyncio
-    async def test_ppl_bfs_calls_ppl_endpoint(
-        self, global_config, embed_func, mock_client
-    ):
-        """When PPL is available, get_knowledge_graph should use PPL endpoint."""
-        mock_client.transport = AsyncMock()
-        # PPL response: connected_edges contains dicts with source_node_id/target_node_id
-        ppl_response = {
-            "schema": [
-                {"name": "entity_id", "type": "string"},
-                {"name": "connected_edges", "type": "struct"},
-            ],
-            "datarows": [
-                [
-                    "A",
-                    [  # connected_edges array
-                        {
-                            "source_node_id": "A",
-                            "target_node_id": "B",
-                            "weight": 1.0,
-                            "_depth": 0,
-                        },
-                        {
-                            "source_node_id": "B",
-                            "target_node_id": "C",
-                            "weight": 0.5,
-                            "_depth": 1,
-                        },
-                    ],
-                ]
-            ],
-        }
-        mock_client.transport.perform_request = AsyncMock(return_value=ppl_response)
-        # get_node for start node verification
-        mock_client.get = AsyncMock(
-            return_value={
-                "_id": "A",
-                "_source": {"entity_type": "person", "description": "Node A"},
-            }
-        )
-        # mget for batch node fetch (only B and C, A is already added)
-        mock_client.mget = AsyncMock(
-            return_value={
-                "docs": [
-                    {"_id": "B", "found": True, "_source": {"entity_type": "person"}},
-                    {"_id": "C", "found": True, "_source": {"entity_type": "person"}},
-                ]
-            }
-        )
-        # search for final edge fetch
-        mock_client.search = AsyncMock(
-            return_value={
-                "hits": {
-                    "hits": [
-                        {
-                            "_id": "e1",
-                            "_source": {
-                                "source_node_id": "A",
-                                "target_node_id": "B",
-                                "relationship": "knows",
-                            },
-                        },
-                        {
-                            "_id": "e2",
-                            "_source": {
-                                "source_node_id": "B",
-                                "target_node_id": "C",
-                                "relationship": "knows",
-                            },
-                        },
-                    ],
-                    "total": {"value": 2},
-                },
-                "aggregations": {
-                    "status_counts": {"buckets": []},
-                    "src": {"buckets": []},
-                    "tgt": {"buckets": []},
-                },
-            }
-        )
-
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            assert s._ppl_graphlookup_available is True
-
-            result = await s.get_knowledge_graph("A", max_depth=2)
-            assert len(result.nodes) == 3
-            assert len(result.edges) == 2
-            # Verify PPL was called (2 for detection + 1 for actual query)
-            assert mock_client.transport.perform_request.await_count == 3
-            # Verify the PPL query uses nodes index as source
-            actual_query = mock_client.transport.perform_request.call_args_list[2]
-            ppl_body = actual_query.kwargs.get("body") or actual_query[1].get(
-                "body", {}
-            )
-            if isinstance(ppl_body, dict):
-                assert s._nodes_index in ppl_body.get("query", "")
-
-    @pytest.mark.asyncio
-    async def test_ppl_bfs_falls_back_on_query_failure(
-        self, global_config, embed_func, mock_client
-    ):
-        """If PPL query fails at runtime, should fall back to client-side BFS."""
-        call_count = {"n": 0}
-
-        async def ppl_side_effect(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] <= 2:
-                # Detection calls succeed
-                return {"datarows": [], "schema": []}
-            # Actual query fails
-            raise Exception("PPL query timeout")
-
-        mock_client.transport = AsyncMock()
-        mock_client.transport.perform_request = AsyncMock(side_effect=ppl_side_effect)
-        mock_client.mget = AsyncMock(
-            return_value={"docs": [{"_id": "A", "found": False}]}
-        )
-
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            assert s._ppl_graphlookup_available is True
-
-            # Should fall back to _bfs_subgraph, which returns empty (node not found)
-            result = await s.get_knowledge_graph("A", max_depth=2)
-            assert len(result.nodes) == 0
-
-    @pytest.mark.asyncio
-    async def test_escape_ppl(self, global_config, embed_func):
+    async def test_client_property_raises_before_init(self, global_config, embed_func):
         s = self._make(global_config, embed_func)
-        assert s._escape_ppl("it's") == "it\\'s"
-        assert s._escape_ppl("normal") == "normal"
-        assert s._escape_ppl("back\\slash") == "back\\\\slash"
-        assert s._escape_ppl("both\\and'quote") == "both\\\\and\\'quote"
-
-    @pytest.mark.asyncio
-    async def test_ppl_bfs_depth_zero_returns_start_only(
-        self, global_config, embed_func, mock_client
-    ):
-        """max_depth=0 should return only the start node without PPL query."""
-        mock_client.transport = AsyncMock()
-        mock_client.transport.perform_request = AsyncMock(
-            return_value={"datarows": [], "schema": []}
-        )
-        mock_client.get = AsyncMock(
-            return_value={"_id": "A", "_source": {"entity_type": "person"}}
-        )
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            assert s._ppl_graphlookup_available is True
-            result = await s.get_knowledge_graph("A", max_depth=0)
-            assert len(result.nodes) == 1
-            assert result.nodes[0].id == "A"
-            assert len(result.edges) == 0
-            # PPL query should NOT have been called for the actual traversal (only 2 detection calls)
-            assert mock_client.transport.perform_request.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_ppl_bfs_empty_connected_edges(
-        self, global_config, embed_func, mock_client
-    ):
-        """PPL returns no connected edges — should return only start node."""
-        mock_client.transport = AsyncMock()
-        ppl_response = {
-            "schema": [
-                {"name": "entity_id", "type": "string"},
-                {"name": "connected_edges", "type": "struct"},
-            ],
-            "datarows": [["A", []]],
-        }
-        mock_client.transport.perform_request = AsyncMock(return_value=ppl_response)
-        mock_client.get = AsyncMock(
-            return_value={"_id": "A", "_source": {"entity_type": "person"}}
-        )
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            result = await s.get_knowledge_graph("A", max_depth=2)
-            assert len(result.nodes) == 1
-            assert result.nodes[0].id == "A"
-
-    @pytest.mark.asyncio
-    async def test_upsert_node_adds_entity_id(
-        self, global_config, embed_func, mock_client
-    ):
-        """upsert_node should always include entity_id field for PPL compatibility."""
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            await s.upsert_node("TestNode", {"description": "test"})
-            body = mock_client.index.call_args.kwargs["body"]
-            assert body["entity_id"] == "TestNode"
-            assert body["description"] == "test"
-
-    @pytest.mark.asyncio
-    async def test_node_degree_uses_count_api(
-        self, global_config, embed_func, mock_client
-    ):
-        """node_degree should use the count API, not search."""
-        mock_client.count = AsyncMock(return_value={"count": 7})
-        with patch.object(ClientManager, "get_client", return_value=mock_client):
-            s = self._make(global_config, embed_func)
-            await s.initialize()
-            degree = await s.node_degree("X")
-            assert degree == 7
-            # Verify count was called on the edges index
-            mock_client.count.assert_awaited()
-            call_kwargs = mock_client.count.call_args
-            assert s._edges_index in str(call_kwargs)
+        with pytest.raises(RuntimeError, match="not been initialized"):
+            _ = s.client
 
 
 # ---------------------------------------------------------------------------
@@ -2016,3 +1662,274 @@ class TestScoreThreshold:
 
     def test_exact_threshold(self):
         assert 0.2 >= 0.2
+
+
+# ---------------------------------------------------------------------------
+# Graph Vector Storage (hybrid retrieval)
+# ---------------------------------------------------------------------------
+
+
+class TestGraphVectorStorage:
+    """Tests for OpenSearchGraphVectorStorage hybrid retrieval."""
+
+    def _make_graph_storage(self, global_config, embed_func, mock_client):
+        """Create a mock graph storage with initialized client."""
+        gs = OpenSearchGraphStorage(
+            namespace="chunk_entity_relation",
+            global_config=global_config,
+            embedding_func=embed_func,
+            workspace="test",
+        )
+        gs._client = mock_client
+        gs._database_ready = True
+        gs._database_name = "test_db-12345678"
+        return gs
+
+    def _make(self, global_config, embed_func, mock_client, node_label="Entity"):
+        gs = self._make_graph_storage(global_config, embed_func, mock_client)
+        key_property = "vdb_id" if node_label == "Entity" else "id"
+        merge_key = "entity_id" if node_label == "Entity" else "id"
+        return OpenSearchGraphVectorStorage(
+            namespace="entities",
+            workspace="test",
+            embedding_func=embed_func,
+            meta_fields={"entity_name", "content", "source_id", "file_path"},
+            node_label=node_label,
+            key_property=key_property,
+            merge_key=merge_key,
+            graph_storage=gs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_initialize_uses_graph_client(self, global_config, embed_func, mock_client):
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        assert s._client is mock_client
+
+    @pytest.mark.asyncio
+    async def test_upsert_entity_nodes(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        await s.upsert({
+            "ent-abc": {"content": "Alice is a researcher", "entity_name": "ALICE"},
+            "ent-def": {"content": "Bob is an engineer", "entity_name": "BOB"},
+        })
+        # Verify Cypher was called with UNWIND MERGE
+        calls = mock_client.transport.perform_request.call_args_list
+        cypher_calls = [c for c in calls if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"]
+        assert len(cypher_calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_upsert_chunk_nodes(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        s = self._make(global_config, embed_func, mock_client, node_label="Chunk")
+        await s.initialize()
+        await s.upsert({
+            "chunk-abc": {"content": "Some text content", "full_doc_id": "doc-xyz"},
+        })
+        calls = mock_client.transport.perform_request.call_args_list
+        cypher_calls = [c for c in calls if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"]
+        # Should have at least 1 call for chunk MERGE + 1 for PART_OF edges
+        assert len(cypher_calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_query_hybrid_retrieval(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "node_id": "ALICE",
+                        "score": 0.9,
+                        "properties": {
+                            "vdb_id": "ent-abc",
+                            "content": "Alice is a researcher",
+                            "entity_name": "ALICE",
+                        },
+                    },
+                    {
+                        "node_id": "BOB",
+                        "score": 0.1,  # Below threshold
+                        "properties": {
+                            "vdb_id": "ent-def",
+                            "content": "Bob",
+                        },
+                    },
+                ]
+            }
+        )
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        results = await s.query("researcher", top_k=10)
+        assert len(results) == 1  # Bob filtered by threshold
+        assert results[0]["id"] == "ent-abc"
+        assert results[0]["entity_name"] == "ALICE"
+
+    @pytest.mark.asyncio
+    async def test_delete(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        await s.delete(["ent-abc", "ent-def"])
+        calls = mock_client.transport.perform_request.call_args_list
+        cypher_calls = [c for c in calls if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"]
+        assert any("DETACH DELETE" in str(c) for c in cypher_calls)
+
+    @pytest.mark.asyncio
+    async def test_get_by_id(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(
+            return_value=_cypher_response(
+                [{"row": [{"entity_name": "ALICE", "content": "researcher"}]}],
+                ["props"],
+            )
+        )
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        result = await s.get_by_id("ent-abc")
+        assert result is not None
+        assert result["id"] == "ent-abc"
+
+    @pytest.mark.asyncio
+    async def test_drop_noop(self, global_config, embed_func, mock_client):
+        s = self._make(global_config, embed_func, mock_client)
+        result = await s.drop()
+        assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_finalize_noop(self, global_config, embed_func, mock_client):
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        await s.finalize()  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# Relationship Adapter
+# ---------------------------------------------------------------------------
+
+
+class TestRelationshipAdapter:
+    """Tests for OpenSearchGraphRelationshipAdapter."""
+
+    def _make(self, global_config, embed_func, mock_client):
+        gs = OpenSearchGraphStorage(
+            namespace="chunk_entity_relation",
+            global_config=global_config,
+            embedding_func=embed_func,
+            workspace="test",
+        )
+        gs._client = mock_client
+        gs._database_ready = True
+        gs._database_name = "test_db-12345678"
+
+        entities_vdb = OpenSearchGraphVectorStorage(
+            namespace="entities",
+            workspace="test",
+            embedding_func=embed_func,
+            meta_fields={"entity_name", "content"},
+            node_label="Entity",
+            key_property="vdb_id",
+            merge_key="entity_id",
+            graph_storage=gs,
+        )
+        entities_vdb._client = mock_client
+
+        adapter = OpenSearchGraphRelationshipAdapter(
+            namespace="relationships",
+            workspace="test",
+            embedding_func=embed_func,
+            meta_fields={"src_id", "tgt_id"},
+            entities_vdb=entities_vdb,
+            graph_storage=gs,
+        )
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_initialize(self, global_config, embed_func, mock_client):
+        adapter = self._make(global_config, embed_func, mock_client)
+        await adapter.initialize()
+        assert adapter._client is mock_client
+
+    @pytest.mark.asyncio
+    async def test_upsert_noop(self, global_config, embed_func, mock_client):
+        adapter = self._make(global_config, embed_func, mock_client)
+        await adapter.upsert({"rel-1": {"content": "test"}})  # Should not raise
+
+    @pytest.mark.asyncio
+    async def test_query_pairwise_edges(self, global_config, embed_func, mock_client):
+        # Mock hybrid retrieval for entities
+        retrieve_resp = {
+            "results": [
+                {
+                    "node_id": "ALICE",
+                    "score": 0.9,
+                    "properties": {"vdb_id": "ent-a", "content": "Alice", "entity_name": "ALICE"},
+                },
+                {
+                    "node_id": "BOB",
+                    "score": 0.8,
+                    "properties": {"vdb_id": "ent-b", "content": "Bob", "entity_name": "BOB"},
+                },
+            ]
+        }
+        # Mock Cypher pairwise edge fetch
+        edge_resp = _cypher_response(
+            [
+                {"row": ["ALICE", "BOB", {"description": "knows", "keywords": "friendship", "weight": 1.0}]},
+            ],
+            ["src", "tgt", "props"],
+        )
+
+        call_count = {"n": 0}
+
+        async def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            path = args[1] if len(args) > 1 else ""
+            if path == "/_plugins/_graph/retrieve":
+                return retrieve_resp
+            return edge_resp
+
+        mock_client.transport.perform_request = AsyncMock(side_effect=side_effect)
+
+        adapter = self._make(global_config, embed_func, mock_client)
+        await adapter.initialize()
+        results = await adapter.query("friendship", top_k=10)
+        assert len(results) >= 1
+        assert results[0]["src_id"] == "ALICE"
+        assert results[0]["tgt_id"] == "BOB"
+        assert results[0]["id"] == compute_mdhash_id("ALICE" + "BOB", prefix="rel-")
+
+    @pytest.mark.asyncio
+    async def test_delete_noop(self, global_config, embed_func, mock_client):
+        adapter = self._make(global_config, embed_func, mock_client)
+        await adapter.delete(["rel-1"])  # Should not raise
+
+    @pytest.mark.asyncio
+    async def test_get_by_id_returns_none(self, global_config, embed_func, mock_client):
+        adapter = self._make(global_config, embed_func, mock_client)
+        assert await adapter.get_by_id("rel-abc") is None
+
+    @pytest.mark.asyncio
+    async def test_get_by_ids_returns_empty(self, global_config, embed_func, mock_client):
+        adapter = self._make(global_config, embed_func, mock_client)
+        assert await adapter.get_by_ids(["rel-1", "rel-2"]) == []
+
+    @pytest.mark.asyncio
+    async def test_get_vectors_returns_empty(self, global_config, embed_func, mock_client):
+        adapter = self._make(global_config, embed_func, mock_client)
+        assert await adapter.get_vectors_by_ids(["rel-1"]) == {}
+
+    @pytest.mark.asyncio
+    async def test_drop_noop(self, global_config, embed_func, mock_client):
+        adapter = self._make(global_config, embed_func, mock_client)
+        result = await adapter.drop()
+        assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_delete_entity_relation(self, global_config, embed_func, mock_client):
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        adapter = self._make(global_config, embed_func, mock_client)
+        await adapter.initialize()
+        await adapter.delete_entity_relation("ALICE")
+        calls = mock_client.transport.perform_request.call_args_list
+        cypher_calls = [c for c in calls if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"]
+        assert any("DELETE r" in str(c) for c in cypher_calls)

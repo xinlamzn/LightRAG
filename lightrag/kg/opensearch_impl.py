@@ -9,6 +9,7 @@ Requirements:
     - OpenSearch 3.x or higher with k-NN plugin enabled
 """
 
+import hashlib
 import os
 import re
 import ssl as ssl_module
@@ -145,6 +146,36 @@ def _build_index_name(workspace: str, namespace: str) -> tuple[str, str, str]:
         effective = ""
     index_name = _sanitize_index_name(final_ns)
     return effective, final_ns, index_name
+
+
+def _sanitize_database_name(workspace: str, namespace: str) -> str:
+    """Build a graph plugin database name from workspace + namespace.
+
+    Steps:
+    1. Concatenate ``{workspace}_{namespace}``, lowercase
+    2. Replace ``[^a-z0-9_-]`` with ``_``
+    3. Strip leading ``_`` / ``-``
+    4. If starts with digit prepend ``g``
+    5. Truncate to 180 chars
+    6. Append ``-`` + first 8 chars of SHA-256 hash of the *original* unsanitized name
+    7. Assert total length <= 200 and matches ``^[a-z][a-z0-9_-]*$``
+    """
+    raw = f"{workspace}_{namespace}"
+    name = raw.lower()
+    name = re.sub(r"[^a-z0-9_-]", "_", name)
+    name = name.lstrip("_-")
+    if not name:
+        name = "g"
+    if name[0].isdigit():
+        name = "g" + name
+    name = name[:180]
+    suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    name = f"{name}-{suffix}"
+    assert len(name) <= 200, f"Database name too long: {len(name)}"
+    assert re.match(
+        r"^[a-z][a-z0-9_-]*$", name
+    ), f"Invalid database name: {name}"
+    return name
 
 
 async def _mget_optional_doc(
@@ -875,21 +906,23 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
 @final
 @dataclass
 class OpenSearchGraphStorage(BaseGraphStorage):
-    """Graph storage using OpenSearch with separate nodes and edges indices.
+    """Graph storage using the OpenSearch graph plugin with Cypher queries.
 
-    Supports two BFS traversal strategies:
-    - PPL graphlookup (server-side BFS, requires OpenSearch SQL plugin with Calcite engine)
-    - Application-level batched BFS (fallback, works on any OpenSearch 3.x+)
+    Uses a dedicated graph plugin database per workspace. All node/edge
+    operations are performed via the ``POST _plugins/_cypher`` endpoint.
+    Entity nodes use ``entity_id`` as the graph key, matching the Neo4J
+    pattern. The database auto-manages two underlying indices:
+    ``{database}-lpg-nodes`` and ``{database}-lpg-edges``.
 
-    The strategy is auto-detected during initialize() and can be overridden via
-    the OPENSEARCH_USE_PPL_GRAPHLOOKUP environment variable (true/false).
+    Traversal strategies:
+    - APOC ``apoc.path.subgraphNodes`` (if available)
+    - Variable-length Cypher paths (default fallback)
     """
 
-    client: AsyncOpenSearch = field(default=None)
-    _nodes_index: str = field(default="", init=False)
-    _edges_index: str = field(default="", init=False)
-    _indices_ready: bool = field(default=False, init=False)
-    _ppl_graphlookup_available: bool = field(default=False, init=False)
+    _client: AsyncOpenSearch = field(default=None, init=False)
+    _database_name: str = field(default="", init=False)
+    _database_ready: bool = field(default=False, init=False)
+    _apoc_available: bool = field(default=False, init=False)
 
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         super().__init__(
@@ -901,216 +934,190 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         self.__post_init__()
 
     def __post_init__(self):
-        self.workspace, self.final_namespace, base_name = _build_index_name(
-            self.workspace, self.namespace
-        )
-        self._nodes_index = f"{base_name}-nodes"
-        self._edges_index = f"{base_name}-edges"
+        effective = _resolve_workspace(self.workspace, self.namespace)
+        self.workspace = effective
+        self._database_name = _sanitize_database_name(effective, self.namespace)
+
+    @property
+    def database_name(self) -> str:
+        """Public property: the graph plugin database name."""
+        return self._database_name
+
+    @property
+    def client(self) -> AsyncOpenSearch:
+        """Public property: the shared AsyncOpenSearch client."""
+        if self._client is None:
+            raise RuntimeError(
+                "OpenSearchGraphStorage has not been initialized. "
+                "Call initialize() first."
+            )
+        return self._client
+
+    # --- Cypher execution ---
+
+    async def _execute_cypher(
+        self, query: str, params: dict | None = None
+    ) -> dict:
+        """Execute a Cypher query against the graph plugin endpoint.
+
+        Args:
+            query: Cypher query string
+            params: Optional Cypher parameters
+
+        Returns:
+            Raw response dict from the ``_plugins/_cypher`` endpoint.
+        """
+        body: dict[str, Any] = {
+            "query": query,
+            "database": self._database_name,
+        }
+        if params:
+            body["parameters"] = params
+        try:
+            return await self._client.transport.perform_request(
+                "POST", "/_plugins/_cypher", body=body
+            )
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Cypher query failed: {e}\nQuery: {query}"
+            )
+            raise
+
+    # --- Database lifecycle ---
+
+    async def _create_database_if_not_exists(self):
+        """Create the graph plugin database with embedding config."""
+        dim = self.embedding_func.embedding_dim
+        db_body = {
+            "embedding": {
+                "dimension": dim,
+                "field": "embedding",
+                "engine": "faiss",
+                "space_type": "cosinesimil",
+            }
+        }
+        try:
+            await self._client.transport.perform_request(
+                "PUT",
+                f"/_plugins/_graph/database/{self._database_name}",
+                body=db_body,
+            )
+            logger.info(
+                f"[{self.workspace}] Created graph database: {self._database_name} (dim={dim})"
+            )
+        except Exception as e:
+            # If database already exists, that's fine
+            if "already_exists" in str(e).lower() or "resource_already_exists" in str(e).lower():
+                logger.debug(
+                    f"[{self.workspace}] Graph database already exists: {self._database_name}"
+                )
+            else:
+                raise
+
+    async def _detect_apoc(self):
+        """Check if APOC procedures are available."""
+        try:
+            await self._execute_cypher(
+                "MATCH (n) RETURN n LIMIT 0"
+            )
+            # Try a simple APOC call
+            await self._execute_cypher(
+                "CALL apoc.path.subgraphNodes({entity_id: '__probe__'}, "
+                "{maxLevel: 0, relationshipFilter: 'DIRECTED'}) YIELD node RETURN node LIMIT 0"
+            )
+            self._apoc_available = True
+            logger.info(f"[{self.workspace}] APOC procedures available")
+        except Exception:
+            self._apoc_available = False
+            logger.info(
+                f"[{self.workspace}] APOC not available, using variable-length Cypher paths"
+            )
 
     async def initialize(self):
-        """Initialize client, create indices, and detect PPL graphlookup support."""
+        """Initialize client, create graph database, detect APOC."""
         async with get_data_init_lock():
-            if self.client is None:
-                self.client = await ClientManager.get_client()
-            await self._create_indices_if_not_exist()
-            self._indices_ready = True
-            await self._detect_ppl_graphlookup()
+            if self._client is None:
+                self._client = await ClientManager.get_client()
+            await self._create_database_if_not_exists()
+            self._database_ready = True
+            await self._detect_apoc()
             logger.debug(
                 f"[{self.workspace}] OpenSearch Graph storage initialized: "
-                f"{self._nodes_index}, {self._edges_index} "
-                f"(PPL graphlookup: {self._ppl_graphlookup_available})"
+                f"database={self._database_name} (APOC: {self._apoc_available})"
             )
 
-    async def _ensure_indices_ready(self):
-        """Recreate graph indices after drop before the next write."""
-        if self._indices_ready:
+    async def _ensure_database_ready(self):
+        """Recreate graph database after drop before the next write."""
+        if self._database_ready:
             return
         async with get_data_init_lock():
-            if self.client is None:
-                self.client = await ClientManager.get_client()
-            if not self._indices_ready:
-                await self._create_indices_if_not_exist()
-                self._indices_ready = True
+            if self._client is None:
+                self._client = await ClientManager.get_client()
+            if not self._database_ready:
+                await self._create_database_if_not_exists()
+                self._database_ready = True
 
-    def _mark_indices_missing(self):
-        """Mark graph indices as unavailable for subsequent read short-circuiting."""
-        self._indices_ready = False
-
-    async def _detect_ppl_graphlookup(self):
-        """Detect whether PPL graphlookup command is available on this cluster."""
-        env_override = os.environ.get("OPENSEARCH_USE_PPL_GRAPHLOOKUP", "").lower()
-        if env_override == "true":
-            self._ppl_graphlookup_available = True
-            return
-        if env_override == "false":
-            self._ppl_graphlookup_available = False
-            return
-        # Auto-detect by sending a minimal PPL query
-        try:
-            await self.client.transport.perform_request(
-                "POST",
-                "/_plugins/_ppl",
-                body={"query": f"source = {self._edges_index} | head 0"},
-            )
-            # PPL endpoint works; now test graphlookup syntax with a no-op query
-            await self.client.transport.perform_request(
-                "POST",
-                "/_plugins/_ppl",
-                body={
-                    "query": (
-                        f"source = {self._edges_index} | head 1 "
-                        f"| graphLookup {self._edges_index} "
-                        f"start=source_node_id edge=target_node_id-->source_node_id "
-                        f"maxDepth=0 as _gl_probe"
-                    )
-                },
-            )
-            self._ppl_graphlookup_available = True
-            logger.info(
-                f"[{self.workspace}] PPL graphlookup is available, using server-side BFS"
-            )
-        except Exception:
-            self._ppl_graphlookup_available = False
-            logger.info(
-                f"[{self.workspace}] PPL graphlookup not available, using client-side BFS"
-            )
-
-    async def _create_indices_if_not_exist(self):
-        try:
-            if not await self.client.indices.exists(index=self._nodes_index):
-                body = {
-                    "mappings": {
-                        "dynamic": True,
-                        "properties": {
-                            "entity_id": {"type": "keyword"},
-                            "entity_type": {"type": "keyword"},
-                            "description": {"type": "text"},
-                            "source_id": {"type": "text"},
-                            "source_ids": {"type": "keyword"},
-                            "file_path": {"type": "keyword"},
-                            "created_at": {"type": "long"},
-                        },
-                    },
-                    "settings": {
-                        "index": {"number_of_shards": 1, "number_of_replicas": 0}
-                    },
-                }
-                await self.client.indices.create(index=self._nodes_index, body=body)
-                logger.info(
-                    f"[{self.workspace}] Created nodes index: {self._nodes_index}"
-                )
-        except RequestError as e:
-            if "resource_already_exists_exception" not in str(e):
-                raise
-
-        try:
-            if not await self.client.indices.exists(index=self._edges_index):
-                body = {
-                    "mappings": {
-                        "dynamic": True,
-                        "properties": {
-                            "source_node_id": {"type": "keyword"},
-                            "target_node_id": {"type": "keyword"},
-                            "relationship": {"type": "keyword"},
-                            "description": {"type": "text"},
-                            "weight": {"type": "float"},
-                            "keywords": {"type": "text"},
-                            "source_id": {"type": "text"},
-                            "source_ids": {"type": "keyword"},
-                            "file_path": {"type": "keyword"},
-                            "created_at": {"type": "long"},
-                        },
-                    },
-                    "settings": {
-                        "index": {"number_of_shards": 1, "number_of_replicas": 0}
-                    },
-                }
-                await self.client.indices.create(index=self._edges_index, body=body)
-                logger.info(
-                    f"[{self.workspace}] Created edges index: {self._edges_index}"
-                )
-        except RequestError as e:
-            if "resource_already_exists_exception" not in str(e):
-                raise
+    def _mark_database_missing(self):
+        """Mark the graph database as unavailable."""
+        self._database_ready = False
 
     async def finalize(self):
         """Release the OpenSearch client connection."""
-        if self.client is not None:
-            await ClientManager.release_client(self.client)
-            self.client = None
+        if self._client is not None:
+            await ClientManager.release_client(self._client)
+            self._client = None
 
     # --- Basic queries ---
 
     async def has_node(self, node_id: str) -> bool:
-        """Check whether a node exists in the graph."""
-        if not self._indices_ready:
+        """Check whether an Entity node exists in the graph."""
+        if not self._database_ready:
             return False
         try:
-            return await self.client.exists(index=self._nodes_index, id=node_id)
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id}) RETURN count(n) > 0 AS exists",
+                {"id": node_id},
+            )
+            rows = resp.get("results", [{}])[0].get("data", [])
+            if rows:
+                return bool(rows[0].get("row", [False])[0])
+            return False
+        except Exception:
             return False
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
-        """Check whether an edge exists between two nodes (bidirectional)."""
-        if not self._indices_ready:
+        """Check whether a DIRECTED edge exists between two Entity nodes (bidirectional)."""
+        if not self._database_ready:
             return False
         try:
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": source_node_id}},
-                                        {"term": {"target_node_id": target_node_id}},
-                                    ]
-                                }
-                            },
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": target_node_id}},
-                                        {"term": {"target_node_id": source_node_id}},
-                                    ]
-                                }
-                            },
-                        ]
-                    }
-                },
-                "size": 0,
-            }
-            response = await self.client.search(index=self._edges_index, body=body)
-            return response["hits"]["total"]["value"] > 0
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            resp = await self._execute_cypher(
+                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]-(b:Entity {entity_id: $tgt}) "
+                "RETURN count(r) > 0 AS exists",
+                {"src": source_node_id, "tgt": target_node_id},
+            )
+            rows = resp.get("results", [{}])[0].get("data", [])
+            if rows:
+                return bool(rows[0].get("row", [False])[0])
+            return False
+        except Exception:
             return False
 
     async def node_degree(self, node_id: str) -> int:
-        """Count the number of edges connected to a node."""
-        if not self._indices_ready:
+        """Count the number of DIRECTED edges connected to an Entity node."""
+        if not self._database_ready:
             return 0
         try:
-            response = await self.client.count(
-                index=self._edges_index,
-                body={
-                    "query": {
-                        "bool": {
-                            "should": [
-                                {"term": {"source_node_id": node_id}},
-                                {"term": {"target_node_id": node_id}},
-                            ]
-                        }
-                    }
-                },
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id}) "
+                "OPTIONAL MATCH (n)-[r:DIRECTED]-() "
+                "RETURN count(r) AS degree",
+                {"id": node_id},
             )
-            return response.get("count", 0)
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            rows = resp.get("results", [{}])[0].get("data", [])
+            if rows:
+                return int(rows[0].get("row", [0])[0])
+            return 0
+        except Exception:
             return 0
 
     async def edge_degree(self, src_id: str, tgt_id: str) -> int:
@@ -1120,301 +1127,170 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         return src_degree + tgt_degree
 
     async def get_node(self, node_id: str) -> dict[str, str] | None:
-        """Get a node document by ID, or None if not found."""
-        if not self._indices_ready:
+        """Get an Entity node by its entity_id."""
+        if not self._database_ready:
             return None
         try:
-            response = await _mget_optional_doc(self.client, self._nodes_index, node_id)
-            if response is None:
-                return None
-            doc = response["_source"]
-            doc["_id"] = response["_id"]
-            return doc
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id}) RETURN properties(n) AS props",
+                {"id": node_id},
+            )
+            rows = resp.get("results", [{}])[0].get("data", [])
+            if rows:
+                props = rows[0].get("row", [None])[0]
+                if props:
+                    props.pop("embedding", None)
+                    return props
+            return None
+        except Exception:
             return None
 
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
-        """Get an edge between two nodes (bidirectional), or None."""
-        if not self._indices_ready:
+        """Get a DIRECTED edge between two Entity nodes (bidirectional)."""
+        if not self._database_ready:
             return None
         try:
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": source_node_id}},
-                                        {"term": {"target_node_id": target_node_id}},
-                                    ]
-                                }
-                            },
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": target_node_id}},
-                                        {"term": {"target_node_id": source_node_id}},
-                                    ]
-                                }
-                            },
-                        ]
-                    }
-                },
-                "size": 1,
-            }
-            response = await self.client.search(index=self._edges_index, body=body)
-            hits = response["hits"]["hits"]
-            if hits:
-                doc = hits[0]["_source"]
-                doc["_id"] = hits[0]["_id"]
-                return doc
+            resp = await self._execute_cypher(
+                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]-(b:Entity {entity_id: $tgt}) "
+                "RETURN properties(r) AS props LIMIT 1",
+                {"src": source_node_id, "tgt": target_node_id},
+            )
+            rows = resp.get("results", [{}])[0].get("data", [])
+            if rows:
+                return rows[0].get("row", [None])[0]
             return None
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+        except Exception:
             return None
 
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
-        """Get all (source, target) edge tuples connected to a node."""
-        if not self._indices_ready:
+        """Get all (source, target) edge tuples for DIRECTED edges connected to a node."""
+        if not self._database_ready:
             return None
         try:
-            query = {
-                "bool": {
-                    "should": [
-                        {"term": {"source_node_id": source_node_id}},
-                        {"term": {"target_node_id": source_node_id}},
-                    ]
-                }
-            }
-            edges = []
-            pit = await self.client.create_pit(
-                index=self._edges_index, params={"keep_alive": "1m"}
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-(c:Entity) "
+                "RETURN n.entity_id AS src, c.entity_id AS tgt",
+                {"id": source_node_id},
             )
-            pit_id = pit["pit_id"]
-            try:
-                search_after = None
-                while True:
-                    body = {
-                        "query": query,
-                        "_source": ["source_node_id", "target_node_id"],
-                        "size": 10000,
-                        "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": [{"_shard_doc": "asc"}],
-                    }
-                    if search_after:
-                        body["search_after"] = search_after
-                    response = await self.client.search(body=body)
-                    hits = response["hits"]["hits"]
-                    if not hits:
-                        break
-                    for hit in hits:
-                        edges.append(
-                            (
-                                hit["_source"]["source_node_id"],
-                                hit["_source"]["target_node_id"],
-                            )
-                        )
-                    search_after = hits[-1]["sort"]
-                    if len(hits) < 10000:
-                        break
-            finally:
-                try:
-                    await self.client.delete_pit(body={"pit_id": [pit_id]})
-                except Exception:
-                    pass
-            return edges
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            rows = resp.get("results", [{}])[0].get("data", [])
+            return [(r["row"][0], r["row"][1]) for r in rows]
+        except Exception:
             return None
 
     # --- Batch operations ---
 
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
-        """Batch-fetch multiple nodes by ID."""
-        if not self._indices_ready:
+        """Batch-fetch multiple Entity nodes by ID."""
+        if not self._database_ready or not node_ids:
             return {}
         try:
-            response = await self.client.mget(
-                index=self._nodes_index, body={"ids": node_ids}
+            resp = await self._execute_cypher(
+                "UNWIND $ids AS id "
+                "MATCH (n:Entity {entity_id: id}) "
+                "RETURN n.entity_id AS eid, properties(n) AS props",
+                {"ids": node_ids},
             )
             result = {}
-            for doc in response["docs"]:
-                if doc.get("found"):
-                    data = doc["_source"]
-                    data["_id"] = doc["_id"]
-                    result[doc["_id"]] = data
+            for row in resp.get("results", [{}])[0].get("data", []):
+                eid = row["row"][0]
+                props = row["row"][1]
+                if props:
+                    props.pop("embedding", None)
+                    result[eid] = props
             return result
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+        except Exception:
             return {}
 
     async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
-        """Batch-fetch edge counts for multiple nodes using aggregations."""
-        if not node_ids:
-            return {}
-        if not self._indices_ready:
+        """Batch-fetch DIRECTED edge counts for multiple Entity nodes."""
+        if not node_ids or not self._database_ready:
             return {}
         try:
-            # Use a single query with aggregations for both source and target
-            body = {
-                "size": 0,
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"terms": {"source_node_id": node_ids}},
-                            {"terms": {"target_node_id": node_ids}},
-                        ]
-                    }
-                },
-                "aggs": {
-                    "source_degrees": {
-                        "terms": {
-                            "field": "source_node_id",
-                            "size": len(node_ids) * 2,
-                        }
-                    },
-                    "target_degrees": {
-                        "terms": {
-                            "field": "target_node_id",
-                            "size": len(node_ids) * 2,
-                        }
-                    },
-                },
-            }
-            response = await self.client.search(index=self._edges_index, body=body)
+            resp = await self._execute_cypher(
+                "UNWIND $ids AS id "
+                "MATCH (n:Entity {entity_id: id}) "
+                "OPTIONAL MATCH (n)-[r:DIRECTED]-() "
+                "RETURN n.entity_id AS eid, count(r) AS degree",
+                {"ids": node_ids},
+            )
             result = {}
-            for bucket in response["aggregations"]["source_degrees"]["buckets"]:
-                if bucket["key"] in node_ids:
-                    result[bucket["key"]] = (
-                        result.get(bucket["key"], 0) + bucket["doc_count"]
-                    )
-            for bucket in response["aggregations"]["target_degrees"]["buckets"]:
-                if bucket["key"] in node_ids:
-                    result[bucket["key"]] = (
-                        result.get(bucket["key"], 0) + bucket["doc_count"]
-                    )
+            for row in resp.get("results", [{}])[0].get("data", []):
+                result[row["row"][0]] = int(row["row"][1])
             return result
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+        except Exception:
             return {}
 
     async def get_nodes_edges_batch(
         self, node_ids: list[str]
     ) -> dict[str, list[tuple[str, str]]]:
-        """Batch-fetch edge tuples for multiple nodes."""
+        """Batch-fetch DIRECTED edge tuples for multiple Entity nodes."""
         result = {nid: [] for nid in node_ids}
-        if not self._indices_ready:
+        if not self._database_ready or not node_ids:
             return result
         try:
-            query = {
-                "bool": {
-                    "should": [
-                        {"terms": {"source_node_id": node_ids}},
-                        {"terms": {"target_node_id": node_ids}},
-                    ]
-                }
-            }
-            pit = await self.client.create_pit(
-                index=self._edges_index, params={"keep_alive": "1m"}
+            resp = await self._execute_cypher(
+                "UNWIND $ids AS id "
+                "MATCH (n:Entity {entity_id: id})-[r:DIRECTED]-(c:Entity) "
+                "RETURN n.entity_id AS src, c.entity_id AS tgt",
+                {"ids": node_ids},
             )
-            pit_id = pit["pit_id"]
-            try:
-                search_after = None
-                while True:
-                    body = {
-                        "query": query,
-                        "_source": ["source_node_id", "target_node_id"],
-                        "size": 10000,
-                        "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": [{"_shard_doc": "asc"}],
-                    }
-                    if search_after:
-                        body["search_after"] = search_after
-                    response = await self.client.search(body=body)
-                    hits = response["hits"]["hits"]
-                    if not hits:
-                        break
-                    for hit in hits:
-                        src = hit["_source"]["source_node_id"]
-                        tgt = hit["_source"]["target_node_id"]
-                        if src in result:
-                            result[src].append((src, tgt))
-                        if tgt in result:
-                            result[tgt].append((src, tgt))
-                    search_after = hits[-1]["sort"]
-                    if len(hits) < 10000:
-                        break
-            finally:
-                try:
-                    await self.client.delete_pit(body={"pit_id": [pit_id]})
-                except Exception:
-                    pass
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
-            pass
-        return result
+            for row in resp.get("results", [{}])[0].get("data", []):
+                src, tgt = row["row"][0], row["row"][1]
+                if src in result:
+                    result[src].append((src, tgt))
+                if tgt in result and tgt != src:
+                    result[tgt].append((src, tgt))
+            return result
+        except Exception:
+            return result
 
     # --- Upsert operations ---
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
-        """Insert or update a node. Adds entity_id for PPL compatibility."""
+        """Insert or update an Entity node via Cypher MERGE."""
         try:
-            await self._ensure_indices_ready()
-            doc = {k: v for k, v in node_data.items() if k != "_id"}
-            doc["entity_id"] = node_id
+            await self._ensure_database_ready()
+            props = {k: v for k, v in node_data.items() if k not in ("_id", "embedding")}
+            props["entity_id"] = node_id
             if node_data.get("source_id", ""):
-                doc["source_ids"] = node_data["source_id"].split(GRAPH_FIELD_SEP)
-            await self.client.index(
-                index=self._nodes_index, id=node_id, body=doc, refresh="wait_for"
+                props["source_ids"] = node_data["source_id"].split(GRAPH_FIELD_SEP)
+
+            # Build dynamic label for entity_type
+            entity_type = node_data.get("entity_type", "")
+            label_clause = ""
+            if entity_type:
+                safe_type = re.sub(r"[^a-zA-Z0-9_]", "_", entity_type)
+                label_clause = f" SET n:`{safe_type}`"
+
+            await self._execute_cypher(
+                f"MERGE (n:Entity {{entity_id: $id}}) "
+                f"SET n += $props{label_clause}",
+                {"id": node_id, "props": props},
             )
-        except OpenSearchException as e:
+        except Exception as e:
             logger.error(f"[{self.workspace}] Error upserting node {node_id}: {e}")
 
     async def upsert_edge(
         self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
     ) -> None:
-        """Insert or update an edge with deterministic ID for bidirectional handling."""
+        """Insert or update a DIRECTED edge via Cypher MERGE."""
         try:
-            await self._ensure_indices_ready()
-            # Ensure source node exists (don't overwrite if it already has data)
-            if not await self.has_node(source_node_id):
-                await self.upsert_node(source_node_id, {})
-
-            doc = {k: v for k, v in edge_data.items() if k != "_id"}
-            doc["source_node_id"] = source_node_id
-            doc["target_node_id"] = target_node_id
+            await self._ensure_database_ready()
+            props = {k: v for k, v in edge_data.items() if k not in ("_id",)}
             if edge_data.get("source_id", ""):
-                doc["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
+                props["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
 
-            # Use a deterministic ID for the edge so upserts work
-            edge_id = compute_mdhash_id(
-                f"{source_node_id}-{target_node_id}", prefix="edge-"
+            await self._execute_cypher(
+                "MATCH (s:Entity {entity_id: $src}) "
+                "WITH s "
+                "MATCH (t:Entity {entity_id: $tgt}) "
+                "MERGE (s)-[r:DIRECTED]->(t) "
+                "SET r += $props",
+                {"src": source_node_id, "tgt": target_node_id, "props": props},
             )
-
-            # Check if reverse edge exists
-            reverse_id = compute_mdhash_id(
-                f"{target_node_id}-{source_node_id}", prefix="edge-"
-            )
-            try:
-                if await self.client.exists(index=self._edges_index, id=reverse_id):
-                    edge_id = reverse_id
-            except OpenSearchException:
-                pass
-
-            await self.client.index(
-                index=self._edges_index, id=edge_id, body=doc, refresh="wait_for"
-            )
-        except OpenSearchException as e:
+        except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error upserting edge {source_node_id}->{target_node_id}: {e}"
             )
@@ -1422,141 +1298,103 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     # --- Delete operations ---
 
     async def delete_node(self, node_id: str) -> None:
-        """Delete a node and all its connected edges."""
+        """Delete an Entity node and all its connected edges (DETACH DELETE)."""
         try:
-            # Delete all edges referencing this node
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"term": {"source_node_id": node_id}},
-                            {"term": {"target_node_id": node_id}},
-                        ]
-                    }
-                }
-            }
-            await self.client.delete_by_query(
-                index=self._edges_index, body=body, refresh=True
+            await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id}) DETACH DELETE n",
+                {"id": node_id},
             )
-            # Delete the node
-            try:
-                await self.client.delete(
-                    index=self._nodes_index, id=node_id, refresh="wait_for"
-                )
-            except NotFoundError:
-                pass
-        except OpenSearchException as e:
+        except Exception as e:
             logger.error(f"[{self.workspace}] Error deleting node {node_id}: {e}")
 
     async def remove_nodes(self, nodes: list[str]) -> None:
-        """Batch-delete multiple nodes and their connected edges."""
+        """Batch-delete multiple Entity nodes and their connected edges."""
         if not nodes:
             return
         logger.info(f"[{self.workspace}] Deleting {len(nodes)} nodes")
         try:
-            # Delete edges
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"terms": {"source_node_id": nodes}},
-                            {"terms": {"target_node_id": nodes}},
-                        ]
-                    }
-                }
-            }
-            await self.client.delete_by_query(
-                index=self._edges_index, body=body, refresh=True
+            await self._execute_cypher(
+                "UNWIND $ids AS id "
+                "MATCH (n:Entity {entity_id: id}) "
+                "DETACH DELETE n",
+                {"ids": nodes},
             )
-            # Delete nodes
-            actions = [
-                {"_op_type": "delete", "_index": self._nodes_index, "_id": nid}
-                for nid in nodes
-            ]
-            await helpers.async_bulk(
-                self.client, actions, raise_on_error=False, refresh="wait_for"
-            )
-        except OpenSearchException as e:
+        except Exception as e:
             logger.error(f"[{self.workspace}] Error removing nodes: {e}")
 
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
-        """Batch-delete multiple edges (bidirectional matching)."""
+        """Batch-delete multiple DIRECTED edges (bidirectional matching)."""
         if not edges:
             return
         logger.info(f"[{self.workspace}] Deleting {len(edges)} edges")
         try:
-            should_clauses = []
-            for src, tgt in edges:
-                should_clauses.append(
-                    {
-                        "bool": {
-                            "must": [
-                                {"term": {"source_node_id": src}},
-                                {"term": {"target_node_id": tgt}},
-                            ]
-                        }
-                    }
-                )
-                should_clauses.append(
-                    {
-                        "bool": {
-                            "must": [
-                                {"term": {"source_node_id": tgt}},
-                                {"term": {"target_node_id": src}},
-                            ]
-                        }
-                    }
-                )
-            body = {"query": {"bool": {"should": should_clauses}}}
-            await self.client.delete_by_query(
-                index=self._edges_index, body=body, refresh=True
+            pairs = [{"src": s, "tgt": t} for s, t in edges]
+            await self._execute_cypher(
+                "UNWIND $pairs AS p "
+                "MATCH (a:Entity {entity_id: p.src})-[r:DIRECTED]-(b:Entity {entity_id: p.tgt}) "
+                "DELETE r",
+                {"pairs": pairs},
             )
-        except OpenSearchException as e:
+        except Exception as e:
             logger.error(f"[{self.workspace}] Error removing edges: {e}")
+
+    # --- Delete document cascade ---
+
+    async def delete_document(self, doc_id: str) -> None:
+        """Delete a Document node and cascade: PART_OF edges, orphaned Chunks, MENTIONED_IN edges."""
+        try:
+            # Find connected chunk IDs
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:PART_OF]->(d:Document {id: $doc_id}) "
+                "RETURN c.id AS chunk_id",
+                {"doc_id": doc_id},
+            )
+            chunk_ids = [
+                r["row"][0]
+                for r in resp.get("results", [{}])[0].get("data", [])
+                if r["row"][0]
+            ]
+
+            if chunk_ids:
+                # Delete MENTIONED_IN edges from entities to these chunks
+                await self._execute_cypher(
+                    "UNWIND $cids AS cid "
+                    "MATCH (e:Entity)-[r:MENTIONED_IN]->(c:Chunk {id: cid}) "
+                    "DELETE r",
+                    {"cids": chunk_ids},
+                )
+                # Delete PART_OF edges and Chunk nodes
+                await self._execute_cypher(
+                    "UNWIND $cids AS cid "
+                    "MATCH (c:Chunk {id: cid}) "
+                    "DETACH DELETE c",
+                    {"cids": chunk_ids},
+                )
+
+            # Delete Document node
+            await self._execute_cypher(
+                "MATCH (d:Document {id: $doc_id}) DETACH DELETE d",
+                {"doc_id": doc_id},
+            )
+        except Exception as e:
+            logger.error(f"[{self.workspace}] Error deleting document {doc_id}: {e}")
 
     # --- Query operations ---
 
     async def get_all_labels(self) -> list[str]:
-        """Get all node IDs (entity names) sorted alphabetically."""
-        if not self._indices_ready:
+        """Get all Entity node entity_ids sorted alphabetically."""
+        if not self._database_ready:
             return []
         try:
-            labels = []
-            pit = await self.client.create_pit(
-                index=self._nodes_index, params={"keep_alive": "1m"}
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity) RETURN n.entity_id AS eid ORDER BY eid"
             )
-            pit_id = pit["pit_id"]
-            try:
-                search_after = None
-                while True:
-                    body = {
-                        "query": {"match_all": {}},
-                        "_source": False,
-                        "size": 10000,
-                        "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": [{"_shard_doc": "asc"}],
-                    }
-                    if search_after:
-                        body["search_after"] = search_after
-                    response = await self.client.search(body=body)
-                    hits = response["hits"]["hits"]
-                    if not hits:
-                        break
-                    for hit in hits:
-                        labels.append(hit["_id"])
-                    search_after = hits[-1]["sort"]
-                    if len(hits) < 10000:
-                        break
-            finally:
-                try:
-                    await self.client.delete_pit(body={"pit_id": [pit_id]})
-                except Exception:
-                    pass
-            labels.sort()
-            return labels
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            return [
+                r["row"][0]
+                for r in resp.get("results", [{}])[0].get("data", [])
+                if r["row"][0]
+            ]
+        except Exception:
             return []
 
     def _construct_graph_node(self, node_id, node_data: dict) -> KnowledgeGraphNode:
@@ -1573,6 +1411,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     "source_ids",
                     "connected_edges",
                     "edge_count",
+                    "embedding",
                 )
             },
         )
@@ -1581,8 +1420,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         return KnowledgeGraphEdge(
             id=edge_id,
             type=edge.get("relationship", ""),
-            source=edge["source_node_id"],
-            target=edge["target_node_id"],
+            source=edge.get("source_node_id", edge.get("src", "")),
+            target=edge.get("target_node_id", edge.get("tgt", "")),
             properties={
                 k: v
                 for k, v in edge.items()
@@ -1591,6 +1430,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     "_id",
                     "source_node_id",
                     "target_node_id",
+                    "src",
+                    "tgt",
                     "relationship",
                     "source_ids",
                 )
@@ -1603,8 +1444,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         max_depth: int = 3,
         max_nodes: int = None,
     ) -> KnowledgeGraph:
-        """Retrieve a subgraph via PPL graphlookup (if available) or client-side BFS."""
-        if not self._indices_ready:
+        """Retrieve a subgraph via APOC (if available) or variable-length Cypher paths."""
+        if not self._database_ready:
             return KnowledgeGraph()
         if max_nodes is None:
             max_nodes = self.global_config.get("max_graph_nodes", 1000)
@@ -1617,613 +1458,287 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             if node_label == "*":
                 result = await self._get_knowledge_graph_all(max_nodes)
-            elif self._ppl_graphlookup_available:
-                result = await self._bfs_subgraph_ppl(node_label, max_depth, max_nodes)
+            elif self._apoc_available:
+                try:
+                    result = await self._bfs_subgraph_apoc(
+                        node_label, max_depth, max_nodes
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.workspace}] APOC traversal failed, falling back to VLP: {e}"
+                    )
+                    self._apoc_available = False
+                    result = await self._bfs_subgraph_vlp(
+                        node_label, max_depth, max_nodes
+                    )
             else:
-                result = await self._bfs_subgraph(node_label, max_depth, max_nodes)
+                result = await self._bfs_subgraph_vlp(
+                    node_label, max_depth, max_nodes
+                )
 
             duration = time.perf_counter() - start
             logger.info(
                 f"[{self.workspace}] Subgraph query in {duration:.4f}s | "
-                f"Nodes: {len(result.nodes)} | Edges: {len(result.edges)} | Truncated: {result.is_truncated}"
+                f"Nodes: {len(result.nodes)} | Edges: {len(result.edges)} | "
+                f"Truncated: {result.is_truncated}"
             )
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
-                return KnowledgeGraph()
+        except Exception as e:
             logger.error(f"[{self.workspace}] Graph query failed: {e}")
 
         return result
 
     async def _get_knowledge_graph_all(self, max_nodes: int) -> KnowledgeGraph:
-        """Get all nodes (up to max_nodes, ranked by degree) and their interconnecting edges."""
+        """Get all Entity nodes (up to max_nodes, ranked by degree) and their edges."""
         result = KnowledgeGraph()
-        if not self._indices_ready:
+        if not self._database_ready:
             return result
         try:
-            total = (await self.client.count(index=self._nodes_index))["count"]
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity) "
+                "OPTIONAL MATCH (n)-[r:DIRECTED]-() "
+                "WITH n, count(r) AS deg "
+                "ORDER BY deg DESC LIMIT $max "
+                "RETURN n.entity_id AS eid, properties(n) AS props",
+                {"max": max_nodes},
+            )
+            rows = resp.get("results", [{}])[0].get("data", [])
+            node_ids = []
+            for row in rows:
+                eid = row["row"][0]
+                props = row["row"][1] or {}
+                props.pop("embedding", None)
+                node_ids.append(eid)
+                result.nodes.append(self._construct_graph_node(eid, props))
+
+            # Check if truncated
+            count_resp = await self._execute_cypher(
+                "MATCH (n:Entity) RETURN count(n) AS cnt"
+            )
+            total = count_resp.get("results", [{}])[0].get("data", [{}])[0].get("row", [0])[0]
             result.is_truncated = total > max_nodes
 
-            if result.is_truncated:
-                # Get top nodes by degree
-                body = {
-                    "size": 0,
-                    "aggs": {
-                        "src": {
-                            "terms": {
-                                "field": "source_node_id",
-                                "size": max_nodes,
-                            }
-                        },
-                        "tgt": {
-                            "terms": {
-                                "field": "target_node_id",
-                                "size": max_nodes,
-                            }
-                        },
-                    },
-                }
-                resp = await self.client.search(index=self._edges_index, body=body)
-                degree_map = {}
-                for bucket in resp["aggregations"]["src"]["buckets"]:
-                    degree_map[bucket["key"]] = (
-                        degree_map.get(bucket["key"], 0) + bucket["doc_count"]
-                    )
-                for bucket in resp["aggregations"]["tgt"]["buckets"]:
-                    degree_map[bucket["key"]] = (
-                        degree_map.get(bucket["key"], 0) + bucket["doc_count"]
-                    )
-                top_ids = sorted(degree_map, key=degree_map.get, reverse=True)[
-                    :max_nodes
-                ]
-            else:
-                # Get all node IDs — use PIT scrolling if max_nodes > 10000
-                top_ids = []
-                if max_nodes <= 10000:
-                    body = {
-                        "query": {"match_all": {}},
-                        "_source": False,
-                        "size": max_nodes,
-                    }
-                    resp = await self.client.search(index=self._nodes_index, body=body)
-                    top_ids = [hit["_id"] for hit in resp["hits"]["hits"]]
-                else:
-                    pit = await self.client.create_pit(
-                        index=self._nodes_index, params={"keep_alive": "1m"}
-                    )
-                    pit_id = pit["pit_id"]
-                    try:
-                        search_after = None
-                        while len(top_ids) < max_nodes:
-                            body = {
-                                "query": {"match_all": {}},
-                                "_source": False,
-                                "size": 10000,
-                                "pit": {"id": pit_id, "keep_alive": "1m"},
-                                "sort": [{"_shard_doc": "asc"}],
-                            }
-                            if search_after:
-                                body["search_after"] = search_after
-                            resp = await self.client.search(body=body)
-                            hits = resp["hits"]["hits"]
-                            if not hits:
-                                break
-                            for hit in hits:
-                                top_ids.append(hit["_id"])
-                                if len(top_ids) >= max_nodes:
-                                    break
-                            search_after = hits[-1]["sort"]
-                            if len(hits) < 10000:
-                                break
-                    finally:
-                        try:
-                            await self.client.delete_pit(body={"pit_id": [pit_id]})
-                        except Exception:
-                            pass
-
-            # Fetch node data
-            if top_ids:
-                node_resp = await self.client.mget(
-                    index=self._nodes_index, body={"ids": top_ids}
+            # Fetch edges between found nodes
+            if node_ids:
+                edge_resp = await self._execute_cypher(
+                    "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
+                    "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
+                    "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                    {"ids": node_ids},
                 )
-                for doc in node_resp["docs"]:
-                    if doc.get("found"):
-                        result.nodes.append(
-                            self._construct_graph_node(doc["_id"], doc["_source"])
-                        )
+                for row in edge_resp.get("results", [{}])[0].get("data", []):
+                    src, tgt, props = row["row"][0], row["row"][1], row["row"][2] or {}
+                    eid = f"{src}-{tgt}"
+                    edge_data = {**props, "source_node_id": src, "target_node_id": tgt}
+                    result.edges.append(self._construct_graph_edge(eid, edge_data))
 
-                # Fetch edges between these nodes
-                edge_body = {
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"terms": {"source_node_id": top_ids}},
-                                {"terms": {"target_node_id": top_ids}},
-                            ]
-                        }
-                    },
-                    "size": 10000,
-                }
-                edge_resp = await self.client.search(
-                    index=self._edges_index, body=edge_body
-                )
-                seen_edges = set()
-                for hit in edge_resp["hits"]["hits"]:
-                    e = hit["_source"]
-                    eid = f"{e['source_node_id']}-{e['target_node_id']}"
-                    if eid not in seen_edges:
-                        seen_edges.add(eid)
-                        result.edges.append(self._construct_graph_edge(eid, e))
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
-                return result
+        except Exception as e:
             logger.error(f"[{self.workspace}] Error in get_knowledge_graph_all: {e}")
         return result
 
-    async def _bfs_subgraph_ppl(
+    async def _bfs_subgraph_apoc(
         self, start_label: str, max_depth: int, max_nodes: int
     ) -> KnowledgeGraph:
-        """Server-side BFS using PPL graphlookup command.
-
-        Queries the nodes index for the start node, then uses graphLookup to traverse
-        the edges index with bidirectional BFS. Uses `flatten` to unnest results and
-        `depthField` for depth-based sorting. Falls back to client-side BFS on failure.
-        """
+        """Subgraph traversal using APOC apoc.path.subgraphNodes."""
         result = KnowledgeGraph()
-
-        # Verify start node exists
-        start_node = await self.get_node(start_label)
-        if not start_node:
-            return result
-
-        seen_nodes = {start_label}
-        result.nodes.append(self._construct_graph_node(start_label, start_node))
-
-        if max_depth == 0:
-            return result
-
-        # PPL maxDepth=0 means 1 hop (direct match), so max_depth-1
-        ppl_depth = max(0, max_depth - 1)
-        escaped = self._escape_ppl(start_label)
-        ppl_query = (
-            f"source = {self._nodes_index}"
-            f" | where entity_id = '{escaped}'"
-            f" | graphLookup {self._edges_index}"
-            f" start=entity_id"
-            f" edge=target_node_id<->source_node_id"
-            f" maxDepth={ppl_depth}"
-            f" depthField=_depth"
-            f" usePIT=true"
-            f" as connected_edges"
+        resp = await self._execute_cypher(
+            "MATCH (start:Entity {entity_id: $id}) "
+            "CALL apoc.path.subgraphNodes(start, "
+            "{maxLevel: $depth, relationshipFilter: 'DIRECTED'}) YIELD node "
+            "WITH node LIMIT $max "
+            "RETURN node.entity_id AS eid, properties(node) AS props",
+            {"id": start_label, "depth": max_depth, "max": max_nodes},
         )
+        rows = resp.get("results", [{}])[0].get("data", [])
+        node_ids = []
+        for row in rows:
+            eid = row["row"][0]
+            props = row["row"][1] or {}
+            props.pop("embedding", None)
+            if eid:
+                node_ids.append(eid)
+                result.nodes.append(self._construct_graph_node(eid, props))
 
-        try:
-            resp = await self.client.transport.perform_request(
-                "POST",
-                "/_plugins/_ppl",
-                body={"query": ppl_query},
-            )
-        except Exception as e:
-            logger.warning(
-                f"[{self.workspace}] PPL graphlookup failed, falling back to client BFS: {e}"
-            )
-            return await self._bfs_subgraph(start_label, max_depth, max_nodes)
+        result.is_truncated = len(node_ids) >= max_nodes
 
-        # Parse PPL response — schema-driven to avoid fragile positional access
-        try:
-            datarows = resp.get("datarows", [])
-            schema = [col["name"] for col in resp.get("schema", [])]
-            ce_idx = (
-                schema.index("connected_edges") if "connected_edges" in schema else -1
-            )
-
-            # Collect all edge rows from connected_edges arrays
-            all_edge_rows = []
-            for row in datarows:
-                edges_arr = row[ce_idx] if ce_idx >= 0 else []
-                if isinstance(edges_arr, list):
-                    all_edge_rows.extend(edges_arr)
-
-            if not all_edge_rows:
-                return result
-
-            # Build field index map from the first edge row if it's a dict,
-            # otherwise fall back to known edge schema order
-            if isinstance(all_edge_rows[0], dict):
-                # Dict-based response (ideal)
-                for edge_row in all_edge_rows:
-                    src = edge_row.get("source_node_id")
-                    tgt = edge_row.get("target_node_id")
-                    if src:
-                        seen_nodes.add(src)
-                    if tgt:
-                        seen_nodes.add(tgt)
-            else:
-                # Positional array — column positions are unknown, fall back to client BFS
-                logger.warning(
-                    f"[{self.workspace}] PPL returned positional arrays, falling back to client BFS"
-                )
-                return await self._bfs_subgraph(start_label, max_depth, max_nodes)
-
-        except (KeyError, IndexError, TypeError, ValueError) as e:
-            logger.warning(
-                f"[{self.workspace}] Error parsing PPL response, falling back: {e}"
-            )
-            return await self._bfs_subgraph(start_label, max_depth, max_nodes)
-
-        # Limit to max_nodes
-        node_ids = list(seen_nodes)[:max_nodes]
-        result.is_truncated = len(seen_nodes) > max_nodes
-
-        # Batch fetch node data (start node already added)
-        new_node_ids = [nid for nid in node_ids if nid != start_label]
-        if new_node_ids:
-            node_resp = await self.client.mget(
-                index=self._nodes_index, body={"ids": new_node_ids}
-            )
-            for doc in node_resp["docs"]:
-                if doc.get("found"):
-                    result.nodes.append(
-                        self._construct_graph_node(doc["_id"], doc["_source"])
-                    )
-
-        # Re-fetch full edge data between collected nodes for complete properties
+        # Fetch edges between found nodes
         if node_ids:
-            edge_body = {
-                "query": {
-                    "bool": {
-                        "must": [
-                            {"terms": {"source_node_id": node_ids}},
-                            {"terms": {"target_node_id": node_ids}},
-                        ]
-                    }
-                },
-                "size": 10000,
-            }
-            edge_resp = await self.client.search(
-                index=self._edges_index, body=edge_body
+            edge_resp = await self._execute_cypher(
+                "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
+                "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
+                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                {"ids": node_ids},
             )
-            seen_edges = set()
-            for hit in edge_resp["hits"]["hits"]:
-                e = hit["_source"]
-                eid = f"{e['source_node_id']}-{e['target_node_id']}"
-                if eid not in seen_edges:
-                    seen_edges.add(eid)
-                    result.edges.append(self._construct_graph_edge(eid, e))
+            for row in edge_resp.get("results", [{}])[0].get("data", []):
+                src, tgt, props = row["row"][0], row["row"][1], row["row"][2] or {}
+                eid = f"{src}-{tgt}"
+                edge_data = {**props, "source_node_id": src, "target_node_id": tgt}
+                result.edges.append(self._construct_graph_edge(eid, edge_data))
 
         return result
 
-    @staticmethod
-    def _escape_ppl(value: str) -> str:
-        """Escape a string for safe inclusion in a PPL single-quoted literal."""
-        return value.replace("\\", "\\\\").replace("'", "\\'")
-
-    async def _bfs_subgraph(
+    async def _bfs_subgraph_vlp(
         self, start_label: str, max_depth: int, max_nodes: int
     ) -> KnowledgeGraph:
-        """BFS traversal from a starting node, batching neighbor lookups per level."""
+        """Subgraph traversal using variable-length Cypher paths."""
         result = KnowledgeGraph()
-        seen_nodes = set()
 
-        # Verify start node exists
-        start_node = await self.get_node(start_label)
-        if not start_node:
-            return result
+        resp = await self._execute_cypher(
+            "MATCH (start:Entity {entity_id: $id}) "
+            f"MATCH path = (start)-[:DIRECTED*1..{max_depth}]-(c:Entity) "
+            "UNWIND nodes(path) AS n "
+            "WITH DISTINCT n LIMIT $max "
+            "RETURN n.entity_id AS eid, properties(n) AS props",
+            {"id": start_label, "max": max_nodes},
+        )
+        rows = resp.get("results", [{}])[0].get("data", [])
+        node_ids = []
+        for row in rows:
+            eid = row["row"][0]
+            props = row["row"][1] or {}
+            props.pop("embedding", None)
+            if eid:
+                node_ids.append(eid)
+                result.nodes.append(self._construct_graph_node(eid, props))
 
-        seen_nodes.add(start_label)
-        result.nodes.append(self._construct_graph_node(start_label, start_node))
-
-        current_level = [start_label]
-        for _ in range(max_depth):
-            if not current_level or len(seen_nodes) >= max_nodes:
-                break
-
-            # Batch fetch all edges for current level
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"terms": {"source_node_id": current_level}},
-                            {"terms": {"target_node_id": current_level}},
-                        ]
-                    }
-                },
-                "_source": ["source_node_id", "target_node_id"],
-                "size": 10000,
-            }
-            try:
-                resp = await self.client.search(index=self._edges_index, body=body)
-            except OpenSearchException:
-                break
-
-            next_level = set()
-            for hit in resp["hits"]["hits"]:
-                src = hit["_source"]["source_node_id"]
-                tgt = hit["_source"]["target_node_id"]
-                if src not in seen_nodes:
-                    next_level.add(src)
-                if tgt not in seen_nodes:
-                    next_level.add(tgt)
-
-            # Limit to max_nodes
-            new_ids = []
-            for nid in next_level:
-                if len(seen_nodes) + len(new_ids) >= max_nodes:
-                    break
-                new_ids.append(nid)
-
-            if new_ids:
-                # Batch fetch node data
-                node_resp = await self.client.mget(
-                    index=self._nodes_index, body={"ids": new_ids}
+        # Add start node if not already included
+        if start_label not in node_ids:
+            start_node = await self.get_node(start_label)
+            if start_node:
+                node_ids.insert(0, start_label)
+                result.nodes.insert(
+                    0, self._construct_graph_node(start_label, start_node)
                 )
-                for doc in node_resp["docs"]:
-                    if doc.get("found"):
-                        seen_nodes.add(doc["_id"])
-                        result.nodes.append(
-                            self._construct_graph_node(doc["_id"], doc["_source"])
-                        )
 
-            current_level = new_ids
+        result.is_truncated = len(node_ids) >= max_nodes
 
-        # Fetch all edges between seen nodes using PIT scrolling
-        all_ids = list(seen_nodes)
-        if all_ids:
-            edge_query = {
-                "bool": {
-                    "must": [
-                        {"terms": {"source_node_id": all_ids}},
-                        {"terms": {"target_node_id": all_ids}},
-                    ]
-                }
-            }
-            try:
-                seen_edges = set()
-                pit = await self.client.create_pit(
-                    index=self._edges_index, params={"keep_alive": "1m"}
-                )
-                pit_id = pit["pit_id"]
-                try:
-                    search_after = None
-                    while True:
-                        edge_body = {
-                            "query": edge_query,
-                            "size": 10000,
-                            "pit": {"id": pit_id, "keep_alive": "1m"},
-                            "sort": [{"_shard_doc": "asc"}],
-                        }
-                        if search_after:
-                            edge_body["search_after"] = search_after
-                        edge_resp = await self.client.search(body=edge_body)
-                        hits = edge_resp["hits"]["hits"]
-                        if not hits:
-                            break
-                        for hit in hits:
-                            e = hit["_source"]
-                            eid = f"{e['source_node_id']}-{e['target_node_id']}"
-                            if eid not in seen_edges:
-                                seen_edges.add(eid)
-                                result.edges.append(self._construct_graph_edge(eid, e))
-                        search_after = hits[-1]["sort"]
-                        if len(hits) < 10000:
-                            break
-                finally:
-                    try:
-                        await self.client.delete_pit(body={"pit_id": [pit_id]})
-                    except Exception:
-                        pass
-            except OpenSearchException:
-                pass
+        # Fetch edges between found nodes
+        if node_ids:
+            edge_resp = await self._execute_cypher(
+                "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
+                "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
+                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                {"ids": node_ids},
+            )
+            for row in edge_resp.get("results", [{}])[0].get("data", []):
+                src, tgt, props = row["row"][0], row["row"][1], row["row"][2] or {}
+                eid = f"{src}-{tgt}"
+                edge_data = {**props, "source_node_id": src, "target_node_id": tgt}
+                result.edges.append(self._construct_graph_edge(eid, edge_data))
 
-        result.is_truncated = len(seen_nodes) >= max_nodes
         return result
 
     async def get_all_nodes(self) -> list[dict]:
-        """Get all nodes with their properties."""
-        if not self._indices_ready:
+        """Get all Entity nodes with their properties."""
+        if not self._database_ready:
             return []
         try:
-            nodes = []
-            pit = await self.client.create_pit(
-                index=self._nodes_index, params={"keep_alive": "1m"}
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity) RETURN n.entity_id AS eid, properties(n) AS props"
             )
-            pit_id = pit["pit_id"]
-            try:
-                search_after = None
-                while True:
-                    body = {
-                        "query": {"match_all": {}},
-                        "size": 10000,
-                        "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": [{"_shard_doc": "asc"}],
-                    }
-                    if search_after:
-                        body["search_after"] = search_after
-                    response = await self.client.search(body=body)
-                    hits = response["hits"]["hits"]
-                    if not hits:
-                        break
-                    for hit in hits:
-                        node = hit["_source"]
-                        node["id"] = hit["_id"]
-                        nodes.append(node)
-                    search_after = hits[-1]["sort"]
-                    if len(hits) < 10000:
-                        break
-            finally:
-                try:
-                    await self.client.delete_pit(body={"pit_id": [pit_id]})
-                except Exception:
-                    pass
+            nodes = []
+            for row in resp.get("results", [{}])[0].get("data", []):
+                props = row["row"][1] or {}
+                props.pop("embedding", None)
+                props["id"] = row["row"][0]
+                nodes.append(props)
             return nodes
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+        except Exception:
             return []
 
     async def get_all_edges(self) -> list[dict]:
-        """Get all edges with source/target fields added."""
-        if not self._indices_ready:
+        """Get all DIRECTED edges."""
+        if not self._database_ready:
             return []
         try:
-            edges = []
-            pit = await self.client.create_pit(
-                index=self._edges_index, params={"keep_alive": "1m"}
+            resp = await self._execute_cypher(
+                "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
+                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props"
             )
-            pit_id = pit["pit_id"]
-            try:
-                search_after = None
-                while True:
-                    body = {
-                        "query": {"match_all": {}},
-                        "size": 10000,
-                        "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": [{"_shard_doc": "asc"}],
-                    }
-                    if search_after:
-                        body["search_after"] = search_after
-                    response = await self.client.search(body=body)
-                    hits = response["hits"]["hits"]
-                    if not hits:
-                        break
-                    for hit in hits:
-                        edge = hit["_source"]
-                        edge["source"] = edge.get("source_node_id")
-                        edge["target"] = edge.get("target_node_id")
-                        edges.append(edge)
-                    search_after = hits[-1]["sort"]
-                    if len(hits) < 10000:
-                        break
-            finally:
-                try:
-                    await self.client.delete_pit(body={"pit_id": [pit_id]})
-                except Exception:
-                    pass
+            edges = []
+            for row in resp.get("results", [{}])[0].get("data", []):
+                props = row["row"][2] or {}
+                props["source"] = row["row"][0]
+                props["target"] = row["row"][1]
+                edges.append(props)
             return edges
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+        except Exception:
             return []
 
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
-        """Get node labels ranked by edge degree (most connected first)."""
-        if not self._indices_ready:
+        """Get Entity node IDs ranked by DIRECTED edge degree."""
+        if not self._database_ready:
             return []
         try:
-            body = {
-                "size": 0,
-                "aggs": {
-                    "src": {"terms": {"field": "source_node_id", "size": limit * 2}},
-                    "tgt": {"terms": {"field": "target_node_id", "size": limit * 2}},
-                },
-            }
-            response = await self.client.search(index=self._edges_index, body=body)
-            degree_map = {}
-            for bucket in response["aggregations"]["src"]["buckets"]:
-                degree_map[bucket["key"]] = (
-                    degree_map.get(bucket["key"], 0) + bucket["doc_count"]
-                )
-            for bucket in response["aggregations"]["tgt"]["buckets"]:
-                degree_map[bucket["key"]] = (
-                    degree_map.get(bucket["key"], 0) + bucket["doc_count"]
-                )
-            sorted_labels = sorted(degree_map, key=degree_map.get, reverse=True)[:limit]
-            return sorted_labels
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity)-[r:DIRECTED]-() "
+                "WITH n.entity_id AS eid, count(r) AS deg "
+                "ORDER BY deg DESC LIMIT $limit "
+                "RETURN eid",
+                {"limit": limit},
+            )
+            return [
+                r["row"][0]
+                for r in resp.get("results", [{}])[0].get("data", [])
+                if r["row"][0]
+            ]
+        except Exception:
             return []
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
-        """Search node labels with wildcard and prefix matching."""
+        """Search Entity node labels with case-insensitive substring matching."""
         query = query.strip()
-        if not query:
-            return []
-        if not self._indices_ready:
+        if not query or not self._database_ready:
             return []
         try:
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"term": {"entity_id": {"value": query, "boost": 10}}},
-                            {
-                                "prefix": {
-                                    "entity_id": {"value": query.lower(), "boost": 5}
-                                }
-                            },
-                            {
-                                "wildcard": {
-                                    "entity_id": {
-                                        "value": f"*{query.lower()}*",
-                                        "case_insensitive": True,
-                                        "boost": 2,
-                                    }
-                                }
-                            },
-                        ]
-                    }
-                },
-                "_source": False,
-                "size": limit,
-            }
-            response = await self.client.search(index=self._nodes_index, body=body)
-            return [hit["_id"] for hit in response["hits"]["hits"]]
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity) "
+                "WHERE toLower(n.entity_id) CONTAINS toLower($q) "
+                "RETURN n.entity_id AS eid LIMIT $limit",
+                {"q": query, "limit": limit},
+            )
+            return [
+                r["row"][0]
+                for r in resp.get("results", [{}])[0].get("data", [])
+                if r["row"][0]
+            ]
+        except Exception:
             return []
 
     async def index_done_callback(self) -> None:
-        """Refresh both node and edge indices."""
-        if not self._indices_ready:
+        """Refresh the graph database node index to make changes searchable."""
+        if not self._database_ready:
             return
         try:
-            await self.client.indices.refresh(index=self._nodes_index)
-            await self.client.indices.refresh(index=self._edges_index)
-        except OpenSearchException as e:
-            if _is_missing_index_error(e):
-                self._mark_indices_missing()
-                return
+            node_index = f"{self._database_name}-lpg-nodes"
+            await self._client.indices.refresh(index=node_index)
+        except Exception:
+            pass
+        try:
+            edge_index = f"{self._database_name}-lpg-edges"
+            await self._client.indices.refresh(index=edge_index)
         except Exception:
             pass
 
     async def drop(self) -> dict[str, str]:
-        """Delete both node and edge indices."""
-        errors = []
-        for idx in (self._nodes_index, self._edges_index):
-            try:
-                await self.client.indices.delete(index=idx)
-                logger.info(f"[{self.workspace}] Dropped graph index: {idx}")
-            except NotFoundError:
-                logger.info(
-                    f"[{self.workspace}] Graph index already missing during drop: {idx}"
-                )
-            except OpenSearchException as e:
-                errors.append(f"{idx}: {e}")
-                logger.error(
-                    f"[{self.workspace}] Error dropping graph index {idx}: {e}"
-                )
-            except Exception as e:
-                errors.append(f"{idx}: {e}")
-                logger.error(
-                    f"[{self.workspace}] Unexpected error dropping graph index {idx}: {e}"
-                )
-
-        self._mark_indices_missing()
-
-        if errors:
-            return {
-                "status": "error",
-                "message": "Failed to drop graph indices: " + "; ".join(errors),
-            }
-
+        """Delete the entire graph database."""
         try:
-            logger.info(f"[{self.workspace}] Dropped graph indices")
-            return {"status": "success", "message": "Graph indices dropped"}
+            await self._client.transport.perform_request(
+                "DELETE",
+                f"/_plugins/_graph/database/{self._database_name}",
+            )
+            logger.info(
+                f"[{self.workspace}] Dropped graph database: {self._database_name}"
+            )
+            self._mark_database_missing()
+            return {
+                "status": "success",
+                "message": f"Graph database {self._database_name} dropped",
+            }
         except Exception as e:
-            logger.error(f"[{self.workspace}] Error finalizing graph drop: {e}")
+            self._mark_database_missing()
+            logger.error(
+                f"[{self.workspace}] Error dropping graph database: {e}"
+            )
             return {"status": "error", "message": str(e)}
 
 
@@ -2663,3 +2178,517 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Unexpected error dropping vector index: {e}"
             )
             return {"status": "error", "message": str(e)}
+
+
+@dataclass
+class OpenSearchGraphVectorStorage(BaseVectorStorage):
+    """Vector storage backed by graph plugin nodes with hybrid retrieval.
+
+    Stores data as graph nodes (Entity or Chunk) and queries via the
+    ``POST _plugins/_graph/retrieve`` hybrid retrieval endpoint. Configured
+    with ``_node_label`` (e.g., "Entity" or "Chunk"), ``_key_property`` for
+    lookups, and ``_merge_key`` for upserts.
+
+    Not directly user-selectable — auto-created when the graph plugin is
+    detected (see ``lightrag.py`` implicit wiring).
+    """
+
+    _graph_storage: OpenSearchGraphStorage = field(default=None, init=False)
+    _client: AsyncOpenSearch = field(default=None, init=False)
+    _node_label: str = field(default="Entity", init=False)
+    _key_property: str = field(default="vdb_id", init=False)
+    _merge_key: str = field(default="entity_id", init=False)
+
+    def __init__(
+        self,
+        namespace,
+        workspace,
+        embedding_func,
+        meta_fields=None,
+        node_label="Entity",
+        key_property="vdb_id",
+        merge_key="entity_id",
+        graph_storage=None,
+        global_config=None,
+    ):
+        super().__init__(
+            namespace=namespace,
+            workspace=workspace or "",
+            global_config=global_config or (graph_storage.global_config if graph_storage else {}),
+            embedding_func=embedding_func,
+            meta_fields=meta_fields or set(),
+        )
+        self._graph_storage = graph_storage
+        self._node_label = node_label
+        self._key_property = key_property
+        self._merge_key = merge_key
+        self._max_batch_size = self.global_config.get("embedding_batch_num", 32)
+        kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
+        self.cosine_better_than_threshold = kwargs.get(
+            "cosine_better_than_threshold", 0.2
+        )
+
+    async def initialize(self):
+        """Obtain client reference from graph storage (no ClientManager call)."""
+        if self._graph_storage is not None:
+            self._client = self._graph_storage.client
+        logger.debug(
+            f"[{self.workspace}] OpenSearchGraphVectorStorage initialized: "
+            f"label={self._node_label}, key={self._key_property}"
+        )
+
+    async def finalize(self):
+        """No-op: graph storage owns the client lifecycle."""
+        pass
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        """Batch-embed and write nodes via Cypher UNWIND."""
+        if not data:
+            return
+
+        logger.debug(
+            f"[{self.workspace}] Upserting {len(data)} {self._node_label} nodes"
+        )
+
+        # Collect items and compute embeddings in batch
+        items = []
+        contents = []
+        for doc_id, doc_data in data.items():
+            items.append((doc_id, doc_data))
+            contents.append(doc_data.get("content", ""))
+
+        # Batch embedding computation
+        batches = [
+            contents[i : i + self._max_batch_size]
+            for i in range(0, len(contents), self._max_batch_size)
+        ]
+        embeddings_list = await asyncio.gather(
+            *[self.embedding_func(batch) for batch in batches]
+        )
+        embeddings = np.concatenate(embeddings_list)
+
+        # Build Cypher items
+        cypher_items = []
+        for i, (doc_id, doc_data) in enumerate(items):
+            props = {k: v for k, v in doc_data.items() if k in self.meta_fields}
+            props["content"] = doc_data.get("content", "")
+
+            if self._node_label == "Entity":
+                entity_name = doc_data.get("entity_name", doc_id)
+                vdb_id = compute_mdhash_id(entity_name, prefix="ent-")
+                cypher_items.append({
+                    "merge_key_val": entity_name,
+                    "vdb_id": vdb_id,
+                    "props": props,
+                    "embedding": embeddings[i].tolist(),
+                })
+            else:
+                # Chunk nodes: key = doc_id
+                cypher_items.append({
+                    "merge_key_val": doc_id,
+                    "props": props,
+                    "embedding": embeddings[i].tolist(),
+                })
+
+        try:
+            gs = self._graph_storage
+            if self._node_label == "Entity":
+                await gs._execute_cypher(
+                    "UNWIND $items AS item "
+                    "MERGE (n:Entity {entity_id: item.merge_key_val}) "
+                    "SET n += item.props, n.embedding = item.embedding, "
+                    "n.vdb_id = item.vdb_id",
+                    {"items": cypher_items},
+                )
+            elif self._node_label == "Chunk":
+                await gs._execute_cypher(
+                    "UNWIND $items AS item "
+                    "MERGE (n:Chunk {id: item.merge_key_val}) "
+                    "SET n += item.props, n.embedding = item.embedding",
+                    {"items": cypher_items},
+                )
+                # Create PART_OF edges to Document nodes
+                part_of_items = []
+                for i, (doc_id, doc_data) in enumerate(items):
+                    full_doc_id = doc_data.get("full_doc_id")
+                    if full_doc_id:
+                        part_of_items.append({
+                            "chunk_id": doc_id,
+                            "doc_id": full_doc_id,
+                        })
+                if part_of_items:
+                    try:
+                        await gs._execute_cypher(
+                            "UNWIND $items AS item "
+                            "MATCH (c:Chunk {id: item.chunk_id}) "
+                            "MATCH (d:Document {id: item.doc_id}) "
+                            "MERGE (c)-[:PART_OF]->(d)",
+                            {"items": part_of_items},
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[{self.workspace}] Failed to create PART_OF edges "
+                            f"(Document node may not exist yet): {e}"
+                        )
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error upserting {self._node_label} nodes: {e}"
+            )
+
+    async def query(
+        self, query: str, top_k: int, query_embedding: list[float] = None
+    ) -> list[dict[str, Any]]:
+        """Hybrid retrieval via ``POST _plugins/_graph/retrieve``."""
+        if query_embedding is not None:
+            query_vector = (
+                query_embedding.tolist()
+                if hasattr(query_embedding, "tolist")
+                else list(query_embedding)
+            )
+        else:
+            embedding = await self.embedding_func([query], _priority=5)
+            query_vector = embedding[0].tolist()
+
+        gs = self._graph_storage
+        retrieve_body = {
+            "query_text": query,
+            "query_vector": query_vector,
+            "database": gs.database_name,
+            "vector_field": "embedding",
+            "seed_k": top_k * 2,
+            "top_k": top_k,
+            "hops": 2,
+            "node_labels": [self._node_label],
+            "weights": {"vector": 0.4, "text": 0.3, "graph": 0.3},
+        }
+
+        try:
+            resp = await self._client.transport.perform_request(
+                "POST", "/_plugins/_graph/retrieve", body=retrieve_body
+            )
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Hybrid retrieval failed for {self._node_label}: {e}"
+            )
+            return []
+
+        results = []
+        for r in resp.get("results", []):
+            props = r.get("properties", {})
+            score = r.get("score", 0.0)
+            if score < self.cosine_better_than_threshold:
+                continue
+
+            if self._node_label == "Entity":
+                doc = {
+                    "id": props.get("vdb_id", r.get("node_id", "")),
+                    "entity_name": r.get("node_id", ""),
+                    "distance": score,
+                }
+            else:
+                doc = {
+                    "id": r.get("node_id", ""),
+                    "distance": score,
+                }
+            # Merge all properties
+            for k, v in props.items():
+                if k not in ("embedding", "vdb_id"):
+                    doc.setdefault(k, v)
+            results.append(doc)
+
+        logger.info(
+            f"[{self.workspace}] Hybrid retrieval on {self._node_label}: "
+            f"top_k={top_k}, results={len(results)}"
+        )
+        return results
+
+    async def delete(self, ids: list[str]) -> None:
+        """Delete nodes by their key_property IDs."""
+        if not ids:
+            return
+        if isinstance(ids, set):
+            ids = list(ids)
+        gs = self._graph_storage
+        try:
+            await gs._execute_cypher(
+                f"UNWIND $ids AS id "
+                f"MATCH (n:{self._node_label} {{{self._key_property}: id}}) "
+                f"DETACH DELETE n",
+                {"ids": ids},
+            )
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error deleting {self._node_label} nodes: {e}"
+            )
+
+    async def delete_entity(self, entity_name: str) -> None:
+        """Delete an entity by name (computes hash ID for vdb_id lookup)."""
+        entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+        await self.delete([entity_id])
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        """Delete all DIRECTED edges for an entity."""
+        gs = self._graph_storage
+        try:
+            await gs._execute_cypher(
+                "MATCH (a:Entity {entity_id: $name})-[r:DIRECTED]-() DELETE r",
+                {"name": entity_name},
+            )
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error deleting relations for {entity_name}: {e}"
+            )
+
+    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+        """Get a node by its key_property."""
+        gs = self._graph_storage
+        try:
+            resp = await gs._execute_cypher(
+                f"MATCH (n:{self._node_label} {{{self._key_property}: $id}}) "
+                f"RETURN properties(n) AS props",
+                {"id": id},
+            )
+            rows = resp.get("results", [{}])[0].get("data", [])
+            if rows:
+                props = rows[0].get("row", [None])[0]
+                if props:
+                    props.pop("embedding", None)
+                    props["id"] = id
+                    return props
+            return None
+        except Exception:
+            return None
+
+    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        """Get multiple nodes by key_property IDs."""
+        if not ids:
+            return []
+        gs = self._graph_storage
+        try:
+            resp = await gs._execute_cypher(
+                f"UNWIND $ids AS id "
+                f"MATCH (n:{self._node_label} {{{self._key_property}: id}}) "
+                f"RETURN id, properties(n) AS props",
+                {"ids": ids},
+            )
+            result_map = {}
+            for row in resp.get("results", [{}])[0].get("data", []):
+                key = row["row"][0]
+                props = row["row"][1] or {}
+                props.pop("embedding", None)
+                props["id"] = key
+                result_map[key] = props
+            return [result_map.get(id) for id in ids]
+        except Exception:
+            return [None] * len(ids)
+
+    async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
+        """Get embedding vectors by key_property IDs."""
+        if not ids:
+            return {}
+        gs = self._graph_storage
+        try:
+            resp = await gs._execute_cypher(
+                f"UNWIND $ids AS id "
+                f"MATCH (n:{self._node_label} {{{self._key_property}: id}}) "
+                f"RETURN id, n.embedding AS emb",
+                {"ids": ids},
+            )
+            result = {}
+            for row in resp.get("results", [{}])[0].get("data", []):
+                key = row["row"][0]
+                emb = row["row"][1]
+                if emb:
+                    result[key] = emb
+            return result
+        except Exception:
+            return {}
+
+    async def index_done_callback(self) -> None:
+        """Refresh the node index to make newly written embeddings searchable."""
+        if self._graph_storage and self._graph_storage._database_ready:
+            try:
+                node_index = f"{self._graph_storage.database_name}-lpg-nodes"
+                await self._client.indices.refresh(index=node_index)
+            except Exception:
+                pass
+
+    async def drop(self) -> dict[str, str]:
+        """No-op: data is dropped when OpenSearchGraphStorage.drop() deletes the database."""
+        return {"status": "success", "message": "data dropped"}
+
+
+@dataclass
+class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
+    """Adapter implementing BaseVectorStorage for relationship retrieval.
+
+    Relationships are stored as DIRECTED graph edges, not as vector embeddings.
+    The ``query()`` method uses hybrid retrieval to find entities, then fetches
+    pairwise DIRECTED edges between them. All other methods are no-ops or
+    trivially implemented.
+
+    Not directly user-selectable — auto-created when the graph plugin is
+    detected (see ``lightrag.py`` implicit wiring).
+    """
+
+    _graph_storage: OpenSearchGraphStorage = field(default=None, init=False)
+    _entities_vdb: OpenSearchGraphVectorStorage = field(default=None, init=False)
+    _client: AsyncOpenSearch = field(default=None, init=False)
+    _max_relationship_results: int = field(default=500, init=False)
+
+    def __init__(
+        self,
+        namespace,
+        workspace,
+        embedding_func,
+        meta_fields=None,
+        entities_vdb=None,
+        graph_storage=None,
+        global_config=None,
+    ):
+        super().__init__(
+            namespace=namespace,
+            workspace=workspace or "",
+            global_config=global_config or (graph_storage.global_config if graph_storage else {}),
+            embedding_func=embedding_func,
+            meta_fields=meta_fields or set(),
+        )
+        self._graph_storage = graph_storage
+        self._entities_vdb = entities_vdb
+
+    async def initialize(self):
+        """Obtain client reference from graph storage (no ClientManager call)."""
+        if self._graph_storage is not None:
+            self._client = self._graph_storage.client
+        logger.debug(
+            f"[{self.workspace}] OpenSearchGraphRelationshipAdapter initialized"
+        )
+
+    async def finalize(self):
+        """No-op: graph storage owns the client lifecycle."""
+        pass
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        """No-op: relationships stored as graph edges by OpenSearchGraphStorage.upsert_edge()."""
+        pass
+
+    async def query(
+        self, query: str, top_k: int, query_embedding: list[float] = None
+    ) -> list[dict[str, Any]]:
+        """Find entities via hybrid retrieval, then fetch pairwise DIRECTED edges.
+
+        Returns results formatted as relationship vector store entries with
+        ``rel-*`` hashed IDs for compatibility with existing callers.
+        """
+        # Step 1: Find relevant entities
+        entity_results = await self._entities_vdb.query(
+            query, top_k=top_k, query_embedding=query_embedding
+        )
+        if not entity_results:
+            return []
+
+        # Extract entity names (the entity_id / graph key)
+        entity_ids = []
+        for r in entity_results:
+            ename = r.get("entity_name")
+            if ename:
+                entity_ids.append(ename)
+        if not entity_ids:
+            return []
+
+        # Step 2: Pairwise edge fetch
+        limit = min(top_k, self._max_relationship_results)
+        gs = self._graph_storage
+        try:
+            resp = await gs._execute_cypher(
+                "MATCH (a:Entity)-[r:DIRECTED]-(b:Entity) "
+                "WHERE a.entity_id IN $entity_ids AND b.entity_id IN $entity_ids "
+                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props "
+                "ORDER BY r.weight DESC "
+                "LIMIT $limit",
+                {"entity_ids": entity_ids, "limit": limit},
+            )
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Pairwise edge query failed: {e}"
+            )
+            return []
+
+        # Step 3: Transform to relationship vector store format
+        results = []
+        seen = set()
+        for row in resp.get("results", [{}])[0].get("data", []):
+            src = row["row"][0]
+            tgt = row["row"][1]
+            props = row["row"][2] or {}
+
+            # Deduplicate bidirectional matches
+            edge_key = tuple(sorted([src, tgt]))
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+
+            description = props.get("description", "")
+            keywords = props.get("keywords", "")
+            weight = props.get("weight", 1.0)
+
+            rel_id = compute_mdhash_id(src + tgt, prefix="rel-")
+            results.append({
+                "id": rel_id,
+                "src_id": src,
+                "tgt_id": tgt,
+                "content": f"{keywords}\t{src}\n{tgt}\n{description}",
+                "description": description,
+                "keywords": keywords,
+                "weight": weight,
+                "distance": weight if isinstance(weight, (int, float)) else 1.0,
+                "source_id": props.get("source_id", ""),
+                "file_path": props.get("file_path", ""),
+            })
+
+        logger.info(
+            f"[{self.workspace}] Relationship query: "
+            f"entities={len(entity_ids)}, edges={len(results)}"
+        )
+        return results
+
+    async def delete(self, ids: list[str]) -> None:
+        """No-op: edge deletion handled by graph storage remove_edges()."""
+        pass
+
+    async def delete_entity(self, entity_name: str) -> None:
+        """No-op: entity deletion cascades edges in graph storage."""
+        pass
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        """Delete all DIRECTED edges for an entity."""
+        gs = self._graph_storage
+        try:
+            await gs._execute_cypher(
+                "MATCH (a:Entity {entity_id: $name})-[r:DIRECTED]-() DELETE r",
+                {"name": entity_name},
+            )
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error deleting relations for {entity_name}: {e}"
+            )
+
+    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+        """Return None: hashed rel-* IDs are not directly reversible."""
+        return None
+
+    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        """Return empty list: callers tolerate empty."""
+        return []
+
+    async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
+        """Return empty dict: no embeddings stored for relationships."""
+        return {}
+
+    async def index_done_callback(self) -> None:
+        """No-op: graph database handles its own commit/refresh."""
+        pass
+
+    async def drop(self) -> dict[str, str]:
+        """No-op: edges are dropped when OpenSearchGraphStorage.drop() deletes the database."""
+        return {"status": "success", "message": "data dropped"}
