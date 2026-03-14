@@ -1015,15 +1015,20 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 raise
 
     async def _detect_apoc(self):
-        """Check if APOC procedures are available."""
+        """Check if APOC procedures are available.
+
+        Uses a MATCH-then-CALL pattern with a non-existent node so the CALL
+        processes zero rows, but the Cypher parser still validates the
+        procedure signature. The start node argument must be a string node
+        ID (not a map) — matching the graph plugin's expected shape.
+        """
         try:
             await self._execute_cypher(
-                "MATCH (n) RETURN n LIMIT 0"
-            )
-            # Try a simple APOC call
-            await self._execute_cypher(
-                "CALL apoc.path.subgraphNodes({entity_id: '__probe__'}, "
-                "{maxLevel: 0, relationshipFilter: 'DIRECTED'}) YIELD node RETURN node LIMIT 0"
+                "OPTIONAL MATCH (start:Entity {entity_id: '__apoc_probe__'}) "
+                "WITH start WHERE start IS NOT NULL "
+                "CALL apoc.path.subgraphNodes(start, "
+                "{maxLevel: 0, relationshipFilter: 'DIRECTED'}) YIELD node "
+                "RETURN node LIMIT 0"
             )
             self._apoc_available = True
             logger.info(f"[{self.workspace}] APOC procedures available")
@@ -1250,50 +1255,42 @@ class OpenSearchGraphStorage(BaseGraphStorage):
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """Insert or update an Entity node via Cypher MERGE."""
-        try:
-            await self._ensure_database_ready()
-            props = {k: v for k, v in node_data.items() if k not in ("_id", "embedding")}
-            props["entity_id"] = node_id
-            if node_data.get("source_id", ""):
-                props["source_ids"] = node_data["source_id"].split(GRAPH_FIELD_SEP)
+        await self._ensure_database_ready()
+        props = {k: v for k, v in node_data.items() if k not in ("_id", "embedding")}
+        props["entity_id"] = node_id
+        if node_data.get("source_id", ""):
+            props["source_ids"] = node_data["source_id"].split(GRAPH_FIELD_SEP)
 
-            # Build dynamic label for entity_type
-            entity_type = node_data.get("entity_type", "")
-            label_clause = ""
-            if entity_type:
-                safe_type = re.sub(r"[^a-zA-Z0-9_]", "_", entity_type)
-                label_clause = f" SET n:`{safe_type}`"
+        # Build dynamic label for entity_type
+        entity_type = node_data.get("entity_type", "")
+        label_clause = ""
+        if entity_type:
+            safe_type = re.sub(r"[^a-zA-Z0-9_]", "_", entity_type)
+            label_clause = f" SET n:`{safe_type}`"
 
-            await self._execute_cypher(
-                f"MERGE (n:Entity {{entity_id: $id}}) "
-                f"SET n += $props{label_clause}",
-                {"id": node_id, "props": props},
-            )
-        except Exception as e:
-            logger.error(f"[{self.workspace}] Error upserting node {node_id}: {e}")
+        await self._execute_cypher(
+            f"MERGE (n:Entity {{entity_id: $id}}) "
+            f"SET n += $props{label_clause}",
+            {"id": node_id, "props": props},
+        )
 
     async def upsert_edge(
         self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
     ) -> None:
         """Insert or update a DIRECTED edge via Cypher MERGE."""
-        try:
-            await self._ensure_database_ready()
-            props = {k: v for k, v in edge_data.items() if k not in ("_id",)}
-            if edge_data.get("source_id", ""):
-                props["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
+        await self._ensure_database_ready()
+        props = {k: v for k, v in edge_data.items() if k not in ("_id",)}
+        if edge_data.get("source_id", ""):
+            props["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
 
-            await self._execute_cypher(
-                "MATCH (s:Entity {entity_id: $src}) "
-                "WITH s "
-                "MATCH (t:Entity {entity_id: $tgt}) "
-                "MERGE (s)-[r:DIRECTED]->(t) "
-                "SET r += $props",
-                {"src": source_node_id, "tgt": target_node_id, "props": props},
-            )
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Error upserting edge {source_node_id}->{target_node_id}: {e}"
-            )
+        await self._execute_cypher(
+            "MATCH (s:Entity {entity_id: $src}) "
+            "WITH s "
+            "MATCH (t:Entity {entity_id: $tgt}) "
+            "MERGE (s)-[r:DIRECTED]->(t) "
+            "SET r += $props",
+            {"src": source_node_id, "tgt": target_node_id, "props": props},
+        )
 
     # --- Delete operations ---
 
@@ -2224,8 +2221,12 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
         self._merge_key = merge_key
         self._max_batch_size = self.global_config.get("embedding_batch_num", 32)
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
-        self.cosine_better_than_threshold = kwargs.get(
-            "cosine_better_than_threshold", 0.2
+        # Hybrid retrieval returns a fused score (vector + text + graph) that
+        # is NOT directly comparable to cosine similarity.  Use a dedicated
+        # threshold (default 0.0 = pass-through) so that the cosine-specific
+        # `cosine_better_than_threshold` is never mis-applied.
+        self.hybrid_score_threshold = kwargs.get(
+            "hybrid_score_threshold", 0.0
         )
 
     async def initialize(self):
@@ -2290,50 +2291,67 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                     "embedding": embeddings[i].tolist(),
                 })
 
-        try:
-            gs = self._graph_storage
-            if self._node_label == "Entity":
-                await gs._execute_cypher(
-                    "UNWIND $items AS item "
-                    "MERGE (n:Entity {entity_id: item.merge_key_val}) "
-                    "SET n += item.props, n.embedding = item.embedding, "
-                    "n.vdb_id = item.vdb_id",
-                    {"items": cypher_items},
-                )
-            elif self._node_label == "Chunk":
-                await gs._execute_cypher(
-                    "UNWIND $items AS item "
-                    "MERGE (n:Chunk {id: item.merge_key_val}) "
-                    "SET n += item.props, n.embedding = item.embedding",
-                    {"items": cypher_items},
-                )
-                # Create PART_OF edges to Document nodes
-                part_of_items = []
-                for i, (doc_id, doc_data) in enumerate(items):
-                    full_doc_id = doc_data.get("full_doc_id")
-                    if full_doc_id:
-                        part_of_items.append({
-                            "chunk_id": doc_id,
-                            "doc_id": full_doc_id,
-                        })
-                if part_of_items:
-                    try:
-                        await gs._execute_cypher(
-                            "UNWIND $items AS item "
-                            "MATCH (c:Chunk {id: item.chunk_id}) "
-                            "MATCH (d:Document {id: item.doc_id}) "
-                            "MERGE (c)-[:PART_OF]->(d)",
-                            {"items": part_of_items},
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"[{self.workspace}] Failed to create PART_OF edges "
-                            f"(Document node may not exist yet): {e}"
-                        )
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Error upserting {self._node_label} nodes: {e}"
+        gs = self._graph_storage
+        if self._node_label == "Entity":
+            await gs._execute_cypher(
+                "UNWIND $items AS item "
+                "MERGE (n:Entity {entity_id: item.merge_key_val}) "
+                "SET n += item.props, n.embedding = item.embedding, "
+                "n.vdb_id = item.vdb_id",
+                {"items": cypher_items},
             )
+            # Create MENTIONED_IN edges from entities to source chunks.
+            mentioned_items = []
+            for _doc_id, doc_data in items:
+                entity_name = doc_data.get("entity_name", _doc_id)
+                source_id = doc_data.get("source_id", "")
+                if source_id:
+                    chunk_ids = [
+                        cid.strip()
+                        for cid in source_id.split(GRAPH_FIELD_SEP)
+                        if cid.strip()
+                    ]
+                    for cid in chunk_ids:
+                        mentioned_items.append({
+                            "entity_name": entity_name,
+                            "chunk_id": cid,
+                        })
+            if mentioned_items:
+                await gs._execute_cypher(
+                    "UNWIND $items AS item "
+                    "MATCH (e:Entity {entity_id: item.entity_name}) "
+                    "MATCH (c:Chunk {id: item.chunk_id}) "
+                    "MERGE (e)-[:MENTIONED_IN]->(c)",
+                    {"items": mentioned_items},
+                )
+        elif self._node_label == "Chunk":
+            await gs._execute_cypher(
+                "UNWIND $items AS item "
+                "MERGE (n:Chunk {id: item.merge_key_val}) "
+                "SET n += item.props, n.embedding = item.embedding",
+                {"items": cypher_items},
+            )
+            # Create PART_OF edges to Document nodes.
+            # Uses MERGE on Document to guarantee the node exists —
+            # avoids silently dropping chunk→document lineage.
+            part_of_items = []
+            for i, (doc_id, doc_data) in enumerate(items):
+                full_doc_id = doc_data.get("full_doc_id")
+                if full_doc_id:
+                    part_of_items.append({
+                        "chunk_id": doc_id,
+                        "doc_id": full_doc_id,
+                        "file_path": doc_data.get("file_path", ""),
+                    })
+            if part_of_items:
+                await gs._execute_cypher(
+                    "UNWIND $items AS item "
+                    "MATCH (c:Chunk {id: item.chunk_id}) "
+                    "MERGE (d:Document {id: item.doc_id}) "
+                    "ON CREATE SET d.file_path = item.file_path "
+                    "MERGE (c)-[:PART_OF]->(d)",
+                    {"items": part_of_items},
+                )
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
@@ -2376,7 +2394,7 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
         for r in resp.get("results", []):
             props = r.get("properties", {})
             score = r.get("score", 0.0)
-            if score < self.cosine_better_than_threshold:
+            if score < self.hybrid_score_threshold:
                 continue
 
             if self._node_label == "Entity":
@@ -2622,8 +2640,11 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
             tgt = row["row"][1]
             props = row["row"][2] or {}
 
-            # Deduplicate bidirectional matches
-            edge_key = tuple(sorted([src, tgt]))
+            # Canonicalize endpoint order so the same edge always
+            # produces the same id, src_id, tgt_id regardless of which
+            # direction Cypher returns the undirected match.
+            canon_src, canon_tgt = sorted([src, tgt])
+            edge_key = (canon_src, canon_tgt)
             if edge_key in seen:
                 continue
             seen.add(edge_key)
@@ -2632,12 +2653,12 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
             keywords = props.get("keywords", "")
             weight = props.get("weight", 1.0)
 
-            rel_id = compute_mdhash_id(src + tgt, prefix="rel-")
+            rel_id = compute_mdhash_id(canon_src + canon_tgt, prefix="rel-")
             results.append({
                 "id": rel_id,
-                "src_id": src,
-                "tgt_id": tgt,
-                "content": f"{keywords}\t{src}\n{tgt}\n{description}",
+                "src_id": canon_src,
+                "tgt_id": canon_tgt,
+                "content": f"{keywords}\t{canon_src}\n{canon_tgt}\n{description}",
                 "description": description,
                 "keywords": keywords,
                 "weight": weight,
@@ -2688,6 +2709,45 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
     async def index_done_callback(self) -> None:
         """No-op: graph database handles its own commit/refresh."""
         pass
+
+    @property
+    async def client_storage(self) -> dict[str, list[dict]]:
+        """Return all DIRECTED edges for export/introspection.
+
+        Returns the same ``{"data": [{"__id__": ..., ...}]}`` shape that
+        ``NanoVectorDBStorage.client_storage`` and
+        ``FaissVectorDBStorage.client_storage`` provide, so that
+        ``export_data()`` in ``utils.py`` works unchanged.
+        """
+        gs = self._graph_storage
+        if gs is None or not gs._database_ready:
+            return {"data": []}
+        try:
+            resp = await gs._execute_cypher(
+                "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
+                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props"
+            )
+        except Exception as e:
+            logger.error(f"[{self.workspace}] client_storage fetch failed: {e}")
+            return {"data": []}
+
+        records = []
+        for row in resp.get("results", [{}])[0].get("data", []):
+            src = row["row"][0]
+            tgt = row["row"][1]
+            props = row["row"][2] or {}
+            canon_src, canon_tgt = sorted([src, tgt])
+            rel_id = compute_mdhash_id(canon_src + canon_tgt, prefix="rel-")
+            records.append({
+                "__id__": rel_id,
+                "src_id": canon_src,
+                "tgt_id": canon_tgt,
+                "description": props.get("description", ""),
+                "keywords": props.get("keywords", ""),
+                "weight": props.get("weight", 1.0),
+                "source_id": props.get("source_id", ""),
+            })
+        return {"data": records}
 
     async def drop(self) -> dict[str, str]:
         """No-op: edges are dropped when OpenSearchGraphStorage.drop() deletes the database."""

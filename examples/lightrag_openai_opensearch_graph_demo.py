@@ -1,17 +1,24 @@
 """
-LightRAG Demo with OpenSearch + OpenAI
+LightRAG Demo with OpenSearch Graph Plugin + OpenAI
 
 This example demonstrates how to use LightRAG with:
 - OpenAI (LLM + Embeddings)
 - OpenSearch-backed storages for:
-  - KV storage
-  - Vector storage (k-NN)
-  - Graph storage (dual-index nodes + edges)
-  - Document status storage
+  - KV storage (OpenSearch indices)
+  - Graph storage (OpenSearch Graph Plugin with Cypher queries)
+  - Document status storage (OpenSearch indices)
+
+Vector storage is provided implicitly by the graph plugin -- entity and
+chunk embeddings are stored directly on graph nodes, and relationship
+lookups go through the graph edges.  There is no need to set
+``vector_storage`` explicitly; LightRAG detects ``OpenSearchGraphStorage``
+and wires up ``OpenSearchGraphVectorStorage`` / ``OpenSearchGraphRelationshipAdapter``
+automatically.
 
 Prerequisites:
-1. OpenSearch cluster running and accessible (3.x or higher with k-NN plugin)
-2. Required indices will be auto-created by LightRAG
+1. OpenSearch cluster running and accessible (3.x or higher with the
+   Graph plugin and k-NN plugin enabled)
+2. Required indices and the graph database will be auto-created by LightRAG
 3. Set environment variables (example .env):
 
    OPENSEARCH_HOSTS=localhost:9200
@@ -99,13 +106,19 @@ async def initialize_rag() -> LightRAG:
         kv_storage="OpenSearchKVStorage",
         doc_status_storage="OpenSearchDocStatusStorage",
         graph_storage="OpenSearchGraphStorage",
-        vector_storage="OpenSearchVectorDBStorage",
+        # vector_storage is intentionally omitted -- OpenSearchGraphStorage
+        # provides implicit vector storage via the graph plugin (embeddings
+        # are stored on graph nodes/edges, not in separate k-NN indices).
     )
 
     # REQUIRED: initialize all storage backends
     await rag.initialize_storages()
 
-    # Clean previous data so the example is re-runnable
+    # Clean previous data so the example is re-runnable.
+    # Drop order matters: graph database first (this also removes the
+    # entity/chunk/relationship vector data stored on graph nodes/edges),
+    # then KV indices and doc status.
+    await rag.chunk_entity_relation_graph.drop()
     for storage in [
         rag.full_docs,
         rag.text_chunks,
@@ -113,10 +126,6 @@ async def initialize_rag() -> LightRAG:
         rag.full_relations,
         rag.entity_chunks,
         rag.relation_chunks,
-        rag.entities_vdb,
-        rag.relationships_vdb,
-        rag.chunks_vdb,
-        rag.chunk_entity_relation_graph,
         rag.llm_response_cache,
         rag.doc_status,
     ]:
