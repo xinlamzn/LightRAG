@@ -1,49 +1,64 @@
+"""
+Step 2: Generate evaluation queries using Bedrock Claude Opus 4.6.
+
+Reads unique contexts, extracts summaries, and uses Claude to generate
+structured questions (5 users x 5 tasks x 5 questions = 125 questions).
+
+Usage:
+    python Step_2.py                          # Generate for agriculture (default)
+    python Step_2.py -d cs                    # Generate for a specific domain
+    python Step_2.py -d agriculture cs legal  # Generate for multiple domains
+
+Environment variables:
+    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+    BEDROCK_LLM_MODEL  (default: us.anthropic.claude-opus-4-6-v1)
+"""
+
+import os
 import json
-from openai import OpenAI
-from transformers import GPT2Tokenizer
+import asyncio
+import argparse
 
+from lightrag.llm.bedrock import bedrock_complete_if_cache
 
-def openai_complete_if_cache(
-    model="gpt-4o", prompt=None, system_prompt=None, history_messages=[], **kwargs
-) -> str:
-    openai_client = OpenAI()
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.extend(history_messages)
-    messages.append({"role": "user", "content": prompt})
-
-    response = openai_client.chat.completions.create(
-        model=model, messages=messages, **kwargs
-    )
-    return response.choices[0].message.content
-
-
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+LLM_MODEL = os.environ.get("BEDROCK_LLM_MODEL", "us.anthropic.claude-opus-4-6-v1")
 
 
 def get_summary(context, tot_tokens=2000):
-    tokens = tokenizer.tokenize(context)
-    half_tokens = tot_tokens // 2
+    """Extract representative tokens from beginning and end of context.
 
-    start_tokens = tokens[1000 : 1000 + half_tokens]
-    end_tokens = tokens[-(1000 + half_tokens) : 1000]
+    Uses a simple character-based approximation (~4 chars per token)
+    instead of requiring the transformers library.
+    """
+    chars_per_token = 4
+    half_chars = (tot_tokens // 2) * chars_per_token
+    offset = 1000 * chars_per_token
 
-    summary_tokens = start_tokens + end_tokens
-    summary = tokenizer.convert_tokens_to_string(summary_tokens)
+    start_text = context[offset : offset + half_chars]
+    end_text = context[-(offset + half_chars) : -offset] if len(context) > offset else ""
 
-    return summary
+    return start_text + end_text
 
 
-clses = ["agriculture"]
-for cls in clses:
-    with open(f"../datasets/unique_contexts/{cls}_unique_contexts.json", mode="r") as f:
+async def generate_questions(cls, input_dir, output_dir):
+    input_file = f"{input_dir}/{cls}_unique_contexts.json"
+    if not os.path.exists(input_file):
+        print(f"Input file not found: {input_file}")
+        return
+
+    with open(input_file, mode="r") as f:
         unique_contexts = json.load(f)
 
-    summaries = [get_summary(context) for context in unique_contexts]
+    print(f"Loaded {len(unique_contexts)} unique contexts for {cls}")
 
+    summaries = [get_summary(context) for context in unique_contexts]
     total_description = "\n\n".join(summaries)
+
+    # Truncate if too long for context window
+    max_chars = 100000
+    if len(total_description) > max_chars:
+        total_description = total_description[:max_chars]
+        print(f"  Truncated description to {max_chars} chars")
 
     prompt = f"""
     Given the following description of a dataset:
@@ -69,10 +84,45 @@ for cls in clses:
         ...
     """
 
-    result = openai_complete_if_cache(model="gpt-4o", prompt=prompt)
+    print(f"Generating questions for {cls} using {LLM_MODEL}...")
+    result = await bedrock_complete_if_cache(
+        LLM_MODEL,
+        prompt,
+        max_tokens=4096,
+    )
 
-    file_path = f"../datasets/questions/{cls}_questions.txt"
+    os.makedirs(output_dir, exist_ok=True)
+    file_path = f"{output_dir}/{cls}_questions.txt"
     with open(file_path, "w") as file:
         file.write(result)
 
     print(f"{cls}_questions written to {file_path}")
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Generate evaluation queries")
+    parser.add_argument(
+        "-d",
+        "--domains",
+        nargs="+",
+        default=["agriculture"],
+        help="Domains to generate questions for (default: agriculture)",
+    )
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        default="../datasets/unique_contexts",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="../datasets/questions",
+    )
+    args = parser.parse_args()
+
+    for cls in args.domains:
+        await generate_questions(cls, args.input_dir, args.output_dir)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
