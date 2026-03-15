@@ -40,27 +40,9 @@ def get_summary(context, tot_tokens=2000):
     return start_text + end_text
 
 
-async def generate_questions(cls, input_dir, output_dir):
-    input_file = f"{input_dir}/{cls}_unique_contexts.json"
-    if not os.path.exists(input_file):
-        print(f"Input file not found: {input_file}")
-        return
-
-    with open(input_file, mode="r") as f:
-        unique_contexts = json.load(f)
-
-    print(f"Loaded {len(unique_contexts)} unique contexts for {cls}")
-
-    summaries = [get_summary(context) for context in unique_contexts]
-    total_description = "\n\n".join(summaries)
-
-    # Truncate if too long for context window
-    max_chars = 100000
-    if len(total_description) > max_chars:
-        total_description = total_description[:max_chars]
-        print(f"  Truncated description to {max_chars} chars")
-
-    prompt = f"""
+def _full_prompt(total_description):
+    """Generate the full evaluation prompt (5 users x 5 tasks x 5 questions = 125)."""
+    return f"""
     Given the following description of a dataset:
 
     {total_description}
@@ -84,7 +66,55 @@ async def generate_questions(cls, input_dir, output_dir):
         ...
     """
 
-    print(f"Generating questions for {cls} using {LLM_MODEL}...")
+
+def _test_prompt(total_description):
+    """Generate a small test prompt (2 users x 1 task x 2 questions = 4)."""
+    return f"""
+    Given the following description of a dataset:
+
+    {total_description}
+
+    Please identify 2 potential users who would engage with this dataset. For each user, list 1 task they would perform with this dataset. Then, for each (user, task) combination, generate 2 questions that require a high-level understanding of the entire dataset.
+
+    Output the results in the following structure:
+    - User 1: [user description]
+        - Task 1: [task description]
+            - Question 1:
+            - Question 2:
+    - User 2: [user description]
+        - Task 1: [task description]
+            - Question 1:
+            - Question 2:
+    """
+
+
+async def generate_questions(cls, input_dir, output_dir, test_mode=False):
+    input_file = f"{input_dir}/{cls}_unique_contexts.json"
+    if not os.path.exists(input_file):
+        print(f"Input file not found: {input_file}")
+        return
+
+    with open(input_file, mode="r") as f:
+        unique_contexts = json.load(f)
+
+    print(f"Loaded {len(unique_contexts)} unique contexts for {cls}")
+
+    summaries = [get_summary(context) for context in unique_contexts]
+    total_description = "\n\n".join(summaries)
+
+    # Truncate if too long for context window
+    max_chars = 100000
+    if len(total_description) > max_chars:
+        total_description = total_description[:max_chars]
+        print(f"  Truncated description to {max_chars} chars")
+
+    if test_mode:
+        prompt = _test_prompt(total_description)
+        print(f"Generating test questions for {cls} using {LLM_MODEL} (test mode: ~4 questions)...")
+    else:
+        prompt = _full_prompt(total_description)
+        print(f"Generating questions for {cls} using {LLM_MODEL} (~125 questions)...")
+
     result = await bedrock_complete_if_cache(
         LLM_MODEL,
         prompt,
@@ -118,10 +148,15 @@ async def main():
         type=str,
         default="../datasets/questions",
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Generate fewer questions for quick end-to-end testing",
+    )
     args = parser.parse_args()
 
     for cls in args.domains:
-        await generate_questions(cls, args.input_dir, args.output_dir)
+        await generate_questions(cls, args.input_dir, args.output_dir, test_mode=args.test)
 
 
 if __name__ == "__main__":

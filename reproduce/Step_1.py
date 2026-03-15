@@ -39,23 +39,28 @@ EMBEDDING_MAX_TOKEN_SIZE = int(
 )
 
 
-def insert_text(rag, file_path):
+async def insert_text(rag, file_path, max_contexts=0):
     with open(file_path, mode="r") as f:
         unique_contexts = json.load(f)
 
-    print(f"Loaded {len(unique_contexts)} unique contexts from {file_path}")
+    total = len(unique_contexts)
+    if max_contexts > 0:
+        unique_contexts = unique_contexts[:max_contexts]
+        print(f"Using {len(unique_contexts)} of {total} contexts (--max-contexts {max_contexts})")
+    else:
+        print(f"Loaded {total} unique contexts from {file_path}")
 
     retries = 0
     max_retries = 3
     while retries < max_retries:
         try:
-            rag.insert(unique_contexts)
+            await rag.ainsert(unique_contexts)
             print("Insertion complete.")
             break
         except Exception as e:
             retries += 1
             print(f"Insertion failed, retrying ({retries}/{max_retries}), error: {e}")
-            time.sleep(10)
+            await asyncio.sleep(10)
     if retries == max_retries:
         print("Insertion failed after exceeding the maximum number of retries")
 
@@ -83,7 +88,7 @@ async def initialize_rag(working_dir):
     return rag
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Insert contexts into LightRAG")
     parser.add_argument(
         "-d",
@@ -91,6 +96,12 @@ def main():
         nargs="+",
         default=["agriculture"],
         help="Domains to insert (default: agriculture)",
+    )
+    parser.add_argument(
+        "--max-contexts",
+        type=int,
+        default=0,
+        help="Max contexts to insert per domain (0 = all, default: 0)",
     )
     args = parser.parse_args()
 
@@ -102,7 +113,7 @@ def main():
         print(f"{'='*60}")
 
         working_dir = f"../{cls}"
-        rag = asyncio.run(initialize_rag(working_dir))
+        rag = await initialize_rag(working_dir)
 
         input_file = f"../datasets/unique_contexts/{cls}_unique_contexts.json"
         if not os.path.exists(input_file):
@@ -110,8 +121,9 @@ def main():
             print("Run Step_0.py first to download and extract contexts.")
             continue
 
-        insert_text(rag, input_file)
+        await insert_text(rag, input_file, max_contexts=args.max_contexts)
+        await rag.finalize_storages()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

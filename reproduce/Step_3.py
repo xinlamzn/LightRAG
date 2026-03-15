@@ -25,7 +25,7 @@ import argparse
 
 from lightrag import LightRAG, QueryParam
 from lightrag.llm.bedrock import bedrock_complete, bedrock_embed
-from lightrag.utils import EmbeddingFunc, setup_logger, always_get_an_event_loop
+from lightrag.utils import EmbeddingFunc, setup_logger
 
 setup_logger("lightrag", level="INFO")
 
@@ -57,22 +57,20 @@ async def process_query(query_text, rag_instance, query_param):
         return None, {"query": query_text, "error": str(e)}
 
 
-def run_queries_and_save_to_json(
+async def run_queries_and_save_to_json(
     queries, rag_instance, query_param, output_file, error_file
 ):
-    loop = always_get_an_event_loop()
-
     with (
-        open(output_file, "a", encoding="utf-8") as result_file,
-        open(error_file, "a", encoding="utf-8") as err_file,
+        open(output_file, "w", encoding="utf-8") as result_file,
+        open(error_file, "w", encoding="utf-8") as err_file,
     ):
         result_file.write("[\n")
         first_entry = True
 
         for i, query_text in enumerate(queries):
             print(f"  Query {i+1}/{len(queries)}: {query_text[:80]}...")
-            result, error = loop.run_until_complete(
-                process_query(query_text, rag_instance, query_param)
+            result, error = await process_query(
+                query_text, rag_instance, query_param
             )
 
             if result:
@@ -108,7 +106,7 @@ async def initialize_rag(working_dir):
     return rag
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Query LightRAG")
     parser.add_argument(
         "-d",
@@ -124,6 +122,12 @@ def main():
         default="hybrid",
         choices=["naive", "local", "global", "hybrid", "mix"],
         help="Query mode (default: hybrid)",
+    )
+    parser.add_argument(
+        "--max-queries",
+        type=int,
+        default=0,
+        help="Max queries to run per domain (0 = all, default: 0)",
     )
     args = parser.parse_args()
 
@@ -142,21 +146,24 @@ def main():
             print("Run Step_2.py first to generate questions.")
             continue
 
-        rag = asyncio.run(initialize_rag(working_dir))
+        rag = await initialize_rag(working_dir)
         query_param = QueryParam(mode=args.mode)
 
         queries = extract_queries(questions_file)
-        print(f"Extracted {len(queries)} queries")
+        if args.max_queries > 0:
+            queries = queries[: args.max_queries]
+        print(f"Running {len(queries)} queries")
 
         result_file = f"{cls}_{args.mode}_result.json"
         error_file = f"{cls}_{args.mode}_errors.json"
 
-        run_queries_and_save_to_json(
+        await run_queries_and_save_to_json(
             queries, rag, query_param, result_file, error_file
         )
 
+        await rag.finalize_storages()
         print(f"Results saved to {result_file}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
