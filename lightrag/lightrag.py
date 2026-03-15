@@ -322,15 +322,11 @@ class LightRAG:
 
     embedding_cache_config: dict[str, Any] = field(
         default_factory=lambda: {
-            "enabled": False,
-            "similarity_threshold": 0.95,
-            "use_llm_check": False,
+            "enabled": True,
         }
     )
     """Configuration for embedding cache.
-    - enabled: If True, enables caching to avoid redundant computations.
-    - similarity_threshold: Minimum similarity score to use cached embeddings.
-    - use_llm_check: If True, validates cached embeddings using an LLM.
+    - enabled: If True, enables exact-match MD5 caching for embedding API calls.
     """
 
     default_embedding_timeout: int = field(
@@ -610,6 +606,16 @@ class LightRAG:
             embedding_func=self.embedding_func,
         )
 
+        self.embedding_cache: BaseKVStorage | None = None
+        if self.embedding_cache_config.get("enabled", True):
+            self.embedding_cache = self.key_string_value_json_storage_cls(
+                namespace=NameSpace.KV_STORE_EMBEDDING_CACHE,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+            )
+        if self.embedding_cache is not None:
+            self.embedding_func._embedding_cache_kv = self.embedding_cache
+
         self.text_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
             workspace=self.workspace,
@@ -773,6 +779,7 @@ class LightRAG:
                 self.entity_chunks,
                 self.relation_chunks,
                 self.llm_response_cache,
+                self.embedding_cache,
                 self.chunk_entity_relation_graph,  # Graph storage before vector stores
                 self.entities_vdb,
                 self.relationships_vdb,
@@ -801,6 +808,7 @@ class LightRAG:
                 ("chunks_vdb", self.chunks_vdb),
                 ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
                 ("llm_response_cache", self.llm_response_cache),
+                ("embedding_cache", self.embedding_cache),
                 ("doc_status", self.doc_status),
             ]
 

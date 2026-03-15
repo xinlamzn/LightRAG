@@ -445,7 +445,6 @@ class EmbeddingFunc:
     model_name: str | None = (
         None  # Model name for implementing workspace data isolation in vector DB
     )
-
     def __post_init__(self):
         """Unwrap nested EmbeddingFunc to prevent double wrapping issues.
 
@@ -454,6 +453,10 @@ class EmbeddingFunc:
         This method detects and unwraps nested EmbeddingFunc instances to ensure
         that only the outermost wrapper's configuration is applied.
         """
+        # Not a dataclass field — invisible to asdict() to avoid circular refs
+        # when LightRAG serializes its config via dataclasses.asdict().
+        self._embedding_cache_kv = None
+
         # Check if func is already an EmbeddingFunc instance and unwrap it
         max_unwrap_depth = 3  # Safety limit to prevent infinite loops
         unwrap_count = 0
@@ -473,6 +476,65 @@ class EmbeddingFunc:
                 "auto-unwrapped to prevent configuration conflicts. "
                 "Consider using .func to access the unwrapped function directly."
             )
+
+    def _compute_embedding_cache_key(self, text: str) -> str:
+        """Compute a cache key for an embedding text."""
+        text_hash = compute_args_hash(text)
+        model = self.model_name or "unknown"
+        return f"emb:{model}:{self.embedding_dim}:{text_hash}"
+
+    async def _embedding_batch_with_cache(
+        self, texts: list[str], **kwargs
+    ) -> np.ndarray:
+        """Compute embeddings with caching support for batch requests."""
+        cache = self._embedding_cache_kv
+        keys = [self._compute_embedding_cache_key(t) for t in texts]
+
+        # Batch lookup
+        cached_results = await cache.get_by_ids(keys)
+
+        # Separate hits and misses
+        miss_indices = []
+        miss_texts = []
+        for i, cached in enumerate(cached_results):
+            if cached is None or "embedding" not in cached:
+                miss_indices.append(i)
+                miss_texts.append(texts[i])
+
+        # If all hits, reconstruct from cache
+        if not miss_indices:
+            embeddings = [
+                np.array(cached_results[i]["embedding"], dtype=np.float32)
+                for i in range(len(texts))
+            ]
+            return np.array(embeddings)
+
+        # Call real embedding function for misses only
+        miss_result = await self.func(miss_texts, **kwargs)
+
+        # Save new embeddings to cache
+        new_entries = {}
+        for idx_in_miss, original_idx in enumerate(miss_indices):
+            vec = miss_result[idx_in_miss]
+            new_entries[keys[original_idx]] = {"embedding": vec.tolist()}
+        await cache.upsert(new_entries)
+
+        # Assemble final result in original order
+        final = [None] * len(texts)
+        # Fill in cached results
+        hit_idx = 0
+        miss_idx = 0
+        for i in range(len(texts)):
+            if miss_idx < len(miss_indices) and i == miss_indices[miss_idx]:
+                final[i] = miss_result[miss_idx]
+                miss_idx += 1
+            else:
+                final[i] = np.array(
+                    cached_results[i]["embedding"], dtype=np.float32
+                )
+                hit_idx += 1
+
+        return np.array(final)
 
     async def __call__(self, *args, **kwargs) -> np.ndarray:
         # Only inject embedding_dim when send_dimensions is True
@@ -499,8 +561,15 @@ class EmbeddingFunc:
             if "max_token_size" in sig.parameters:
                 kwargs["max_token_size"] = self.max_token_size
 
-        # Call the actual embedding function
-        result = await self.func(*args, **kwargs)
+        # Use embedding cache if available and input is a batch of texts
+        if (
+            self._embedding_cache_kv is not None
+            and args
+            and isinstance(args[0], (list, tuple))
+        ):
+            result = await self._embedding_batch_with_cache(args[0], **kwargs)
+        else:
+            result = await self.func(*args, **kwargs)
 
         # Validate embedding dimensions using total element count
         total_elements = result.size  # Total number of elements in the numpy array
