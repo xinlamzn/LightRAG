@@ -45,6 +45,32 @@ from opensearchpy.exceptions import OpenSearchException, NotFoundError, RequestE
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
 
+# Property schema for promoted fields in the graph plugin database.
+# Promoted fields are stored as typed top-level OpenSearch fields instead
+# of string key-value pairs in the ``properties`` flat_object.  This enables
+# proper BM25 text analysis on ``content``/``description`` fields (improving
+# hybrid retrieval quality), numeric sorting on ``weight``, and efficient
+# exact-match indexing on keyword fields.
+_GRAPH_PROPERTY_SCHEMA = {
+    "nodes": {
+        "entity_id": {"type": "keyword"},
+        "entity_type": {"type": "keyword"},
+        "vdb_id": {"type": "keyword"},
+        "content": {"type": "text"},
+        "description": {"type": "text"},
+        "file_path": {"type": "keyword"},
+        "full_doc_id": {"type": "keyword"},
+        "tokens": {"type": "integer"},
+        "chunk_order_index": {"type": "integer"},
+    },
+    "edges": {
+        "weight": {"type": "float"},
+        "description": {"type": "text"},
+        "keywords": {"type": "text"},
+    },
+    "strict": False,
+}
+
 
 def _get_opensearch_env(key, fallback):
     cfg_key = key.replace("OPENSEARCH_", "").lower()
@@ -1012,7 +1038,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "field": "embedding",
                 "engine": "faiss",
                 "space_type": "cosinesimil",
-            }
+            },
+            "schema": _GRAPH_PROPERTY_SCHEMA,
         }
         try:
             await self._client.transport.perform_request(
@@ -1322,6 +1349,13 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         props = {k: v for k, v in edge_data.items() if k not in ("_id",)}
         if edge_data.get("source_id", ""):
             props["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
+
+        # Ensure weight is a float for the promoted field schema.
+        if "weight" in props:
+            try:
+                props["weight"] = float(props["weight"])
+            except (ValueError, TypeError):
+                pass
 
         await self._execute_cypher(
             "MATCH (s:Entity {entity_id: $src}) "
@@ -2334,6 +2368,14 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
             props = {k: v for k, v in doc_data.items() if k in self.meta_fields}
             props["content"] = doc_data.get("content", "")
 
+            # Ensure integer promoted fields are properly typed.
+            for int_field in ("tokens", "chunk_order_index"):
+                if int_field in props:
+                    try:
+                        props[int_field] = int(props[int_field])
+                    except (ValueError, TypeError):
+                        pass
+
             if self._node_label == "Entity":
                 entity_name = doc_data.get("entity_name", doc_id)
                 vdb_id = compute_mdhash_id(entity_name, prefix="ent-")
@@ -2487,9 +2529,10 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
             if score < self.hybrid_score_threshold:
                 continue
 
-            # Hybrid retrieval returns property keys with a "properties."
-            # prefix (e.g., "properties.entity_id").  Strip the prefix so
-            # downstream code sees plain keys.
+            # Hybrid retrieval returns property keys in the ``properties`` map.
+            # Non-promoted fields have a "properties." prefix (e.g.,
+            # "properties.source_id").  Promoted fields appear without the prefix
+            # (e.g., "entity_id", "content").  ``removeprefix`` handles both.
             props = {}
             for k, v in raw_props.items():
                 clean_key = k.removeprefix("properties.")

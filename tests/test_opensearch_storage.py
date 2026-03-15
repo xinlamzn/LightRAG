@@ -25,6 +25,7 @@ from lightrag.kg.opensearch_impl import (
     _resolve_workspace,
     _sanitize_index_name,
     _sanitize_database_name,
+    _GRAPH_PROPERTY_SCHEMA,
 )
 from lightrag.base import DocStatus, DocProcessingStatus
 from lightrag.utils import compute_mdhash_id
@@ -1005,6 +1006,32 @@ class TestGraphStorage:
             assert "_plugins/_graph/database/" in put_calls[0][0][1]
 
     @pytest.mark.asyncio
+    async def test_database_creation_includes_schema(
+        self, global_config, embed_func, mock_client
+    ):
+        """PUT body to create database must contain both embedding and schema keys."""
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        with patch.object(ClientManager, "get_client", return_value=mock_client):
+            s = self._make(global_config, embed_func)
+            await s.initialize()
+            calls = mock_client.transport.perform_request.call_args_list
+            put_calls = [c for c in calls if c[0][0] == "PUT"]
+            assert len(put_calls) >= 1
+            body = put_calls[0].kwargs.get("body", {})
+            assert "embedding" in body
+            assert "schema" in body
+            schema = body["schema"]
+            assert len(schema["nodes"]) == 9
+            assert len(schema["edges"]) == 3
+            assert schema["strict"] is False
+            # Verify specific field types
+            assert schema["nodes"]["content"]["type"] == "text"
+            assert schema["nodes"]["entity_id"]["type"] == "keyword"
+            assert schema["nodes"]["tokens"]["type"] == "integer"
+            assert schema["edges"]["weight"]["type"] == "float"
+            assert schema["edges"]["description"]["type"] == "text"
+
+    @pytest.mark.asyncio
     async def test_has_node_true(self, global_config, embed_func, mock_client):
         mock_client.transport.perform_request = AsyncMock(
             return_value=_cypher_response(
@@ -1170,6 +1197,51 @@ class TestGraphStorage:
                 if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"
             ]
             assert len(cypher_calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_upsert_edge_weight_coerced_to_float(
+        self, global_config, embed_func, mock_client
+    ):
+        """String weight must be coerced to float for the promoted field schema."""
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        with patch.object(ClientManager, "get_client", return_value=mock_client):
+            s = self._make(global_config, embed_func)
+            await s.initialize()
+            await s.upsert_edge("A", "B", {"weight": "2.5", "description": "knows"})
+            calls = mock_client.transport.perform_request.call_args_list
+            cypher_calls = [
+                c for c in calls
+                if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"
+            ]
+            # Find the MERGE call for the edge
+            merge_call = [c for c in cypher_calls if "MERGE" in str(c)]
+            assert len(merge_call) >= 1
+            params = merge_call[-1].kwargs.get("body", {}).get("parameters", {})
+            props = params.get("props", {})
+            assert isinstance(props.get("weight"), float)
+            assert props["weight"] == 2.5
+
+    @pytest.mark.asyncio
+    async def test_upsert_edge_weight_already_float(
+        self, global_config, embed_func, mock_client
+    ):
+        """Float weight must remain float (no conversion error)."""
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        with patch.object(ClientManager, "get_client", return_value=mock_client):
+            s = self._make(global_config, embed_func)
+            await s.initialize()
+            await s.upsert_edge("A", "B", {"weight": 1.0, "description": "knows"})
+            calls = mock_client.transport.perform_request.call_args_list
+            cypher_calls = [
+                c for c in calls
+                if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"
+            ]
+            merge_call = [c for c in cypher_calls if "MERGE" in str(c)]
+            assert len(merge_call) >= 1
+            params = merge_call[-1].kwargs.get("body", {}).get("parameters", {})
+            props = params.get("props", {})
+            assert isinstance(props.get("weight"), float)
+            assert props["weight"] == 1.0
 
     @pytest.mark.asyncio
     async def test_delete_node(self, global_config, embed_func, mock_client):
@@ -1883,6 +1955,47 @@ class TestGraphVectorStorage:
         assert len(part_of_calls) == 1, "PART_OF should MERGE Document, not MATCH"
 
     @pytest.mark.asyncio
+    async def test_upsert_chunk_tokens_coerced_to_int(
+        self, global_config, embed_func, mock_client
+    ):
+        """String tokens/chunk_order_index must be coerced to int for promoted fields."""
+        mock_client.transport.perform_request = AsyncMock(return_value={})
+        gs = self._make_graph_storage(global_config, embed_func, mock_client)
+        s = OpenSearchGraphVectorStorage(
+            namespace="chunks",
+            workspace="test",
+            embedding_func=embed_func,
+            meta_fields={"content", "file_path", "full_doc_id", "tokens", "chunk_order_index"},
+            node_label="Chunk",
+            key_property="id",
+            merge_key="id",
+            graph_storage=gs,
+        )
+        s._client = mock_client
+        await s.initialize()
+        await s.upsert({
+            "chunk-abc": {
+                "content": "Some text",
+                "tokens": "42",
+                "chunk_order_index": "7",
+                "full_doc_id": "doc-xyz",
+            },
+        })
+        calls = mock_client.transport.perform_request.call_args_list
+        cypher_calls = [
+            c for c in calls
+            if len(c[0]) >= 2 and c[0][1] == "/_plugins/_cypher"
+        ]
+        # Find the MERGE call for the chunk
+        merge_calls = [c for c in cypher_calls if "MERGE (n:Chunk" in str(c)]
+        assert len(merge_calls) >= 1
+        params = merge_calls[0].kwargs.get("body", {}).get("parameters", {})
+        assert isinstance(params.get("tokens"), int), f"tokens should be int, got {type(params.get('tokens'))}"
+        assert params["tokens"] == 42
+        assert isinstance(params.get("chunk_order_index"), int), f"chunk_order_index should be int, got {type(params.get('chunk_order_index'))}"
+        assert params["chunk_order_index"] == 7
+
+    @pytest.mark.asyncio
     async def test_upsert_propagates_cypher_errors(
         self, global_config, embed_func, mock_client
     ):
@@ -1970,6 +2083,69 @@ class TestGraphVectorStorage:
         await s.initialize()
         results = await s.query("test", top_k=10)
         assert len(results) == 2  # Both pass with default threshold 0.0
+
+    @pytest.mark.asyncio
+    async def test_hybrid_retrieval_promoted_keys(
+        self, global_config, embed_func, mock_client
+    ):
+        """Promoted fields appear WITHOUT the 'properties.' prefix in the properties map."""
+        mock_client.transport.perform_request = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "node_id": "uuid-alice-005",
+                        "score": 0.9,
+                        "properties": {
+                            "entity_id": "ALICE",
+                            "vdb_id": "ent-abc",
+                            "content": "Alice is a researcher",
+                            "entity_name": "ALICE",
+                            "__labels": '["Entity"]',
+                        },
+                    },
+                ]
+            }
+        )
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        results = await s.query("researcher", top_k=10)
+        assert len(results) == 1
+        assert results[0]["entity_name"] == "ALICE"
+        assert results[0]["id"] == "ent-abc"
+        assert results[0]["content"] == "Alice is a researcher"
+
+    @pytest.mark.asyncio
+    async def test_hybrid_retrieval_mixed_keys(
+        self, global_config, embed_func, mock_client
+    ):
+        """Mix of promoted (unprefixed) and non-promoted (prefixed) keys in properties."""
+        mock_client.transport.perform_request = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "node_id": "uuid-alice-006",
+                        "score": 0.9,
+                        "properties": {
+                            "entity_id": "ALICE",
+                            "vdb_id": "ent-abc",
+                            "content": "Alice is a researcher",
+                            "entity_name": "ALICE",
+                            "properties.source_id": "chunk-1",
+                            "__labels": '["Entity"]',
+                        },
+                    },
+                ]
+            }
+        )
+        s = self._make(global_config, embed_func, mock_client)
+        await s.initialize()
+        results = await s.query("researcher", top_k=10)
+        assert len(results) == 1
+        assert results[0]["entity_name"] == "ALICE"
+        assert results[0]["id"] == "ent-abc"
+        assert results[0]["content"] == "Alice is a researcher"
+        # Non-promoted field should also be available (prefix stripped)
+        assert results[0]["source_id"] == "chunk-1"
 
     @pytest.mark.asyncio
     async def test_delete(self, global_config, embed_func, mock_client):
