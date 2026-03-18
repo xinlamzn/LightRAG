@@ -380,7 +380,7 @@ class OpenSearchKVStorage(BaseKVStorage):
             )
         try:
             success, failed = await helpers.async_bulk(
-                self.client, actions, raise_on_error=False, refresh="wait_for"
+                self.client, actions, raise_on_error=False, refresh="false"
             )
             if failed:
                 logger.warning(
@@ -983,13 +983,14 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     # --- Cypher execution ---
 
     async def _execute_cypher(
-        self, query: str, params: dict | None = None
+        self, query: str, params: dict | None = None, retries: int = 3
     ) -> dict:
         """Execute a Cypher query against the graph plugin endpoint.
 
         Args:
             query: Cypher query string
             params: Optional Cypher parameters
+            retries: Number of retry attempts on transient failures
 
         Returns:
             Raw response dict from the ``_plugins/_cypher`` endpoint.
@@ -997,21 +998,34 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             - Write queries: ``{"stats": {"nodesCreated": N, ...}}``
             - Read queries: ``{"columns": ["a", "b"], "data": [{"a": 1, "b": 2}, ...]}``
         """
+        import asyncio
+
         body: dict[str, Any] = {
             "query": query,
             "database": self._database_name,
         }
         if params:
             body["parameters"] = params
-        try:
-            return await self._client.transport.perform_request(
-                "POST", "/_plugins/_cypher", body=body
-            )
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Cypher query failed: {e}\nQuery: {query}"
-            )
-            raise
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                return await self._client.transport.perform_request(
+                    "POST", "/_plugins/_cypher", body=body
+                )
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        f"[{self.workspace}] Cypher query failed (attempt {attempt + 1}/{retries + 1}), "
+                        f"retrying in {wait}s: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"[{self.workspace}] Cypher query failed after {retries + 1} attempts: {last_exc}\nQuery: {query}"
+                    )
+                    raise
 
     @staticmethod
     def _cypher_rows(resp: dict) -> list[list]:
@@ -1143,12 +1157,12 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             return False
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
-        """Check whether a DIRECTED edge exists between two Entity nodes (bidirectional)."""
+        """Check whether a DIRECTED edge exists between two Entity nodes."""
         if not self._database_ready:
             return False
         try:
             resp = await self._execute_cypher(
-                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]-(b:Entity {entity_id: $tgt}) "
+                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]->(b:Entity {entity_id: $tgt}) "
                 "RETURN count(r) > 0 AS exists",
                 {"src": source_node_id, "tgt": target_node_id},
             )
@@ -1164,9 +1178,12 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._database_ready:
             return 0
         try:
+            # Use direct MATCH instead of OPTIONAL MATCH — the graph plugin's
+            # OPTIONAL MATCH scans ALL edges of the type (O(E)), while direct
+            # MATCH uses the adjacency list and is O(degree).  Returns 0 rows
+            # (not degree=0) when the node has no edges; we handle that below.
             resp = await self._execute_cypher(
-                "MATCH (n:Entity {entity_id: $id}) "
-                "OPTIONAL MATCH (n)-[r:DIRECTED]-() "
+                "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-() "
                 "RETURN count(r) AS degree",
                 {"id": node_id},
             )
@@ -1205,12 +1222,12 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
-        """Get a DIRECTED edge between two Entity nodes (bidirectional)."""
+        """Get a DIRECTED edge between two Entity nodes."""
         if not self._database_ready:
             return None
         try:
             resp = await self._execute_cypher(
-                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]-(b:Entity {entity_id: $tgt}) "
+                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]->(b:Entity {entity_id: $tgt}) "
                 "RETURN properties(r) AS props LIMIT 1",
                 {"src": source_node_id, "tgt": target_node_id},
             )
@@ -1261,23 +1278,43 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             return {}
 
     async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
-        """Batch-fetch DIRECTED edge counts for multiple Entity nodes."""
+        """Batch-fetch DIRECTED edge counts for multiple Entity nodes.
+
+        Uses MATCH ... WHERE IN instead of UNWIND to avoid the graph plugin's
+        cross-join row limit (UNWIND size × total_edges < 1M).
+        Uses direct MATCH instead of OPTIONAL MATCH to avoid O(E) edge scanning.
+        """
         if not node_ids or not self._database_ready:
             return {}
+        result = {}
         try:
             resp = await self._execute_cypher(
-                "UNWIND $ids AS id "
-                "MATCH (n:Entity {entity_id: id}) "
-                "OPTIONAL MATCH (n)-[r:DIRECTED]-() "
+                "MATCH (n:Entity)-[r:DIRECTED]-() "
+                "WHERE n.entity_id IN $ids "
                 "RETURN n.entity_id AS eid, count(r) AS degree",
                 {"ids": node_ids},
             )
-            result = {}
             for row in self._cypher_rows(resp):
                 result[row[0]] = int(row[1])
-            return result
         except Exception:
-            return {}
+            # Fall back to individual queries
+            for nid in node_ids:
+                try:
+                    resp = await self._execute_cypher(
+                        "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-() "
+                        "RETURN count(r) AS degree",
+                        {"id": nid},
+                        retries=0,
+                    )
+                    rows = self._cypher_rows(resp)
+                    result[nid] = int(rows[0][0]) if rows else 0
+                except Exception:
+                    result[nid] = 0
+        # Nodes with 0 DIRECTED edges won't appear in results — fill them in.
+        for nid in node_ids:
+            if nid not in result:
+                result[nid] = 0
+        return result
 
     async def get_nodes_edges_batch(
         self, node_ids: list[str]
@@ -1288,8 +1325,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             return result
         try:
             resp = await self._execute_cypher(
-                "UNWIND $ids AS id "
-                "MATCH (n:Entity {entity_id: id})-[r:DIRECTED]-(c:Entity) "
+                "MATCH (n:Entity)-[r:DIRECTED]-(c:Entity) "
+                "WHERE n.entity_id IN $ids "
                 "RETURN n.entity_id AS src, c.entity_id AS tgt",
                 {"ids": node_ids},
             )
@@ -1299,15 +1336,90 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     result[src].append((src, tgt))
                 if tgt in result and tgt != src:
                     result[tgt].append((src, tgt))
-            return result
         except Exception:
-            return result
+            for nid in node_ids:
+                try:
+                    resp = await self._execute_cypher(
+                        "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-(c:Entity) "
+                        "RETURN n.entity_id AS src, c.entity_id AS tgt",
+                        {"id": nid},
+                        retries=0,
+                    )
+                    for row in self._cypher_rows(resp):
+                        src, tgt = row[0], row[1]
+                        if src in result:
+                            result[src].append((src, tgt))
+                        if tgt in result and tgt != src:
+                            result[tgt].append((src, tgt))
+                except Exception:
+                    pass
+        return result
+
+    async def get_edges_batch(
+        self, pairs: list[dict[str, str]]
+    ) -> dict[tuple[str, str], dict]:
+        """Batch-fetch edge properties for multiple (src, tgt) pairs.
+
+        Uses a single WHERE IN query to fetch all edges between the entity set,
+        then filters client-side.  This replaces N individual get_edge() calls.
+        """
+        if not pairs or not self._database_ready:
+            return {}
+        # Collect all unique entity IDs from the pairs.
+        all_ids = list({p["src"] for p in pairs} | {p["tgt"] for p in pairs})
+        wanted = {(p["src"], p["tgt"]) for p in pairs}
+
+        result = {}
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (a:Entity)-[r:DIRECTED]-(b:Entity) "
+                "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
+                "RETURN a.entity_id, b.entity_id, properties(r)",
+                {"ids": all_ids},
+            )
+            for row in self._cypher_rows(resp):
+                src, tgt, props = row[0], row[1], row[2]
+                key = (src, tgt)
+                rev = (tgt, src)
+                if key in wanted and key not in result:
+                    result[key] = props if props else {}
+                elif rev in wanted and rev not in result:
+                    result[rev] = props if props else {}
+        except Exception:
+            # Fall back to individual queries
+            for p in pairs:
+                edge = await self.get_edge(p["src"], p["tgt"])
+                if edge is not None:
+                    result[(p["src"], p["tgt"])] = edge
+        return result
+
+    async def edge_degrees_batch(
+        self, edge_pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], int]:
+        """Batch edge degree computation.
+
+        Collects unique node IDs from all pairs, calls node_degrees_batch once,
+        then sums src + tgt degrees for each pair.
+        """
+        if not edge_pairs:
+            return {}
+        all_ids = list({nid for pair in edge_pairs for nid in pair})
+        degrees = await self.node_degrees_batch(all_ids)
+        return {
+            (src, tgt): degrees.get(src, 0) + degrees.get(tgt, 0)
+            for src, tgt in edge_pairs
+        }
 
     # --- Upsert operations ---
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """Insert or update an Entity node via Cypher MERGE."""
         await self._ensure_database_ready()
+        # Strip leading hyphens — the graph plugin's index scanner fails
+        # when it encounters property values with leading hyphens (Bug 3).
+        node_id = node_id.lstrip("-").strip()
+        if not node_id:
+            return
         props = {k: v for k, v in node_data.items() if k not in ("_id", "embedding")}
         props["entity_id"] = node_id
         if node_data.get("source_id", ""):
@@ -1344,8 +1456,18 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     async def upsert_edge(
         self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
     ) -> None:
-        """Insert or update a DIRECTED edge via Cypher MERGE."""
+        """Insert or update a DIRECTED edge.
+
+        Avoids Cypher ``MERGE`` on edges because the graph plugin scans ALL
+        edges of the given type to check for duplicates, making it O(E).
+        Instead we check existence first, then CREATE or SET.
+        """
         await self._ensure_database_ready()
+        # Strip leading hyphens (Bug 3 workaround).
+        source_node_id = source_node_id.lstrip("-").strip()
+        target_node_id = target_node_id.lstrip("-").strip()
+        if not source_node_id or not target_node_id:
+            return
         props = {k: v for k, v in edge_data.items() if k not in ("_id",)}
         if edge_data.get("source_id", ""):
             props["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
@@ -1355,17 +1477,40 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             try:
                 props["weight"] = float(props["weight"])
             except (ValueError, TypeError):
-                pass
+                props["weight"] = 1.0
+        else:
+            props["weight"] = 1.0
 
-        await self._execute_cypher(
-            "MATCH (s:Entity {entity_id: $src}) "
-            "WITH s "
-            "MATCH (t:Entity {entity_id: $tgt}) "
-            "MERGE (s)-[r:DIRECTED]->(t) "
-            "ON CREATE SET r += $props "
-            "ON MATCH SET r += $props",
-            {"src": source_node_id, "tgt": target_node_id, "props": props},
+        params = {"src": source_node_id, "tgt": target_node_id, "props": props}
+
+        # Check if edge already exists (~0.2s vs 17s for MERGE).
+        resp = await self._execute_cypher(
+            "MATCH (s:Entity {entity_id: $src})-[r:DIRECTED]->(t:Entity {entity_id: $tgt}) "
+            "RETURN count(r) AS cnt",
+            params,
         )
+        exists = resp.get("data", [{}])[0].get("cnt", 0) > 0
+
+        if exists:
+            await self._execute_cypher(
+                "MATCH (s:Entity {entity_id: $src})-[r:DIRECTED]->(t:Entity {entity_id: $tgt}) "
+                "SET r += $props",
+                params,
+            )
+        else:
+            # Graph plugin bug: CREATE ... SET r += $props in the same
+            # statement silently drops the SET.  Split into two calls.
+            await self._execute_cypher(
+                "MATCH (s:Entity {entity_id: $src}), (t:Entity {entity_id: $tgt}) "
+                "CREATE (s)-[r:DIRECTED]->(t)",
+                params,
+            )
+            if props:
+                await self._execute_cypher(
+                    "MATCH (s:Entity {entity_id: $src})-[r:DIRECTED]->(t:Entity {entity_id: $tgt}) "
+                    "SET r += $props",
+                    params,
+                )
 
     # --- Delete operations ---
 
@@ -1395,7 +1540,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error removing nodes: {e}")
 
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
-        """Batch-delete multiple DIRECTED edges (bidirectional matching)."""
+        """Batch-delete multiple DIRECTED edges."""
         if not edges:
             return
         logger.info(f"[{self.workspace}] Deleting {len(edges)} edges")
@@ -1403,7 +1548,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             pairs = [{"src": s, "tgt": t} for s, t in edges]
             await self._execute_cypher(
                 "UNWIND $pairs AS p "
-                "MATCH (a:Entity {entity_id: p.src})-[r:DIRECTED]-(b:Entity {entity_id: p.tgt}) "
+                "MATCH (a:Entity {entity_id: p.src})-[r:DIRECTED]->(b:Entity {entity_id: p.tgt}) "
                 "DELETE r",
                 {"pairs": pairs},
             )
@@ -2006,7 +2151,7 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
         ]
         try:
             success, failed = await helpers.async_bulk(
-                self.client, actions, raise_on_error=False, refresh="wait_for"
+                self.client, actions, raise_on_error=False, refresh="false"
             )
             if failed:
                 logger.warning(
@@ -2426,12 +2571,16 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                         if cid.strip()
                     ]
                     for cid in chunk_ids:
-                        await gs._execute_cypher(
-                            "MATCH (e:Entity {entity_id: $ename}) "
-                            "MATCH (c:Chunk {id: $cid}) "
-                            "MERGE (e)-[:MENTIONED_IN]->(c)",
-                            {"ename": entity_name, "cid": cid},
+                        p = {"ename": entity_name, "cid": cid}
+                        resp = await gs._execute_cypher(
+                            "MATCH (e:Entity {entity_id: $ename})-[r:MENTIONED_IN]->(c:Chunk {id: $cid}) "
+                            "RETURN count(r) AS cnt", p,
                         )
+                        if resp.get("data", [{}])[0].get("cnt", 0) == 0:
+                            await gs._execute_cypher(
+                                "MATCH (e:Entity {entity_id: $ename}), (c:Chunk {id: $cid}) "
+                                "CREATE (e)-[:MENTIONED_IN]->(c)", p,
+                            )
         elif self._node_label == "Chunk":
             set_clause = ", ".join(set_parts) if set_parts else "n.content = $content"
             for item in cypher_items:
@@ -2451,20 +2600,33 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
             for _doc_id, doc_data in items:
                 full_doc_id = doc_data.get("full_doc_id")
                 if full_doc_id:
+                    p = {
+                        "cid": _doc_id,
+                        "did": full_doc_id,
+                        "fp": doc_data.get("file_path", ""),
+                    }
+                    # Upsert Document node (MERGE on nodes is fast).
                     await gs._execute_cypher(
-                        "MATCH (c:Chunk {id: $cid}) "
                         "MERGE (d:Document {id: $did}) "
                         "ON CREATE SET d.file_path = $fp "
-                        "ON MATCH SET d.file_path = $fp "
-                        "MERGE (c)-[:PART_OF]->(d)",
-                        {
-                            "cid": _doc_id,
-                            "did": full_doc_id,
-                            "fp": doc_data.get("file_path", ""),
-                        },
+                        "ON MATCH SET d.file_path = $fp",
+                        p,
                     )
+                    # Check-then-CREATE for PART_OF edge.
+                    resp = await gs._execute_cypher(
+                        "MATCH (c:Chunk {id: $cid})-[r:PART_OF]->(d:Document {id: $did}) "
+                        "RETURN count(r) AS cnt", p,
+                    )
+                    if resp.get("data", [{}])[0].get("cnt", 0) == 0:
+                        await gs._execute_cypher(
+                            "MATCH (c:Chunk {id: $cid}), (d:Document {id: $did}) "
+                            "CREATE (c)-[:PART_OF]->(d)", p,
+                        )
 
         # --- Step 3: Bulk-update top-level embedding via OpenSearch ---
+        # The graph plugin requires a top-level ``embedding`` field (knn_vector)
+        # for hybrid retrieval, but Cypher SET only writes to ``properties.*``.
+        # A direct index update is the only way to populate the promoted field.
         if node_uuids:
             node_index = f"{gs.database_name}-lpg-nodes"
             actions = []
@@ -2474,7 +2636,11 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                 actions.append({"update": {"_index": node_index, "_id": uuid}})
                 actions.append({
                     "script": {
-                        "source": "ctx._source.embedding = params.embedding",
+                        "source": (
+                            "ctx._source.embedding = params.embedding; "
+                            "if (ctx._source.properties == null) { ctx._source.properties = new HashMap(); } "
+                            "ctx._source.properties.embedding = params.embedding"
+                        ),
                         "params": {"embedding": embeddings[idx].tolist()},
                     }
                 })
@@ -2661,7 +2827,7 @@ class OpenSearchGraphVectorStorage(BaseVectorStorage):
                 key = row[0]
                 emb = row[1]
                 if emb:
-                    result[key] = emb
+                    result[key] = [float(v) for v in emb]
             return result
         except Exception:
             return {}
@@ -2761,6 +2927,7 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
         # Step 2: Pairwise edge fetch
         limit = min(top_k, self._max_relationship_results)
         gs = self._graph_storage
+        all_rows = []
         try:
             resp = await gs._execute_cypher(
                 "MATCH (a:Entity)-[r:DIRECTED]-(b:Entity) "
@@ -2770,16 +2937,27 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
                 "LIMIT $limit",
                 {"entity_ids": entity_ids, "limit": limit},
             )
-        except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Pairwise edge query failed: {e}"
-            )
-            return []
+            all_rows = gs._cypher_rows(resp)
+        except Exception:
+            # Full list failed — fall back to per-entity star queries
+            for eid in entity_ids:
+                try:
+                    resp = await gs._execute_cypher(
+                        "MATCH (a:Entity {entity_id: $eid})-[r:DIRECTED]-(b:Entity) "
+                        "WHERE b.entity_id IN $entity_ids "
+                        "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props "
+                        "ORDER BY r.weight DESC LIMIT $limit",
+                        {"eid": eid, "entity_ids": entity_ids, "limit": limit},
+                        retries=0,
+                    )
+                    all_rows.extend(gs._cypher_rows(resp))
+                except Exception:
+                    pass
 
         # Step 3: Transform to relationship vector store format
         results = []
         seen = set()
-        for row in gs._cypher_rows(resp):
+        for row in all_rows:
             src = row[0]
             tgt = row[1]
             props = row[2] or {}

@@ -513,6 +513,99 @@ async def ali_rerank(
     )
 
 
+async def bedrock_rerank(
+    query: str,
+    documents: List[str],
+    top_n: Optional[int] = None,
+    api_key: Optional[str] = None,
+    model: str = "amazon.rerank-v1:0",
+    base_url: Optional[str] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Rerank documents using Amazon Bedrock Rerank API.
+
+    Uses the bedrock-agent-runtime service. Authentication is handled via
+    the standard AWS credential chain (env vars, ~/.aws/credentials, IAM role).
+
+    Args:
+        query: The search query
+        documents: List of strings to rerank
+        top_n: Number of top results to return
+        api_key: Unused, kept for interface compatibility
+        model: Bedrock rerank model ID (default: amazon.rerank-v1:0)
+        base_url: Unused, kept for interface compatibility
+        extra_body: Additional model request fields
+
+    Returns:
+        List of dict with "index" and "relevance_score" keys
+    """
+    import aioboto3
+
+    region = os.environ.get("AWS_REGION", "us-east-1")
+
+    # Build the model ARN
+    if model.startswith("arn:"):
+        model_arn = model
+    else:
+        model_arn = f"arn:aws:bedrock:{region}::foundation-model/{model}"
+
+    sources = [
+        {
+            "type": "INLINE",
+            "inlineDocumentSource": {
+                "type": "TEXT",
+                "textDocument": {"text": doc},
+            },
+        }
+        for doc in documents
+    ]
+
+    request_params = {
+        "queries": [{"type": "TEXT", "textQuery": {"text": query}}],
+        "sources": sources,
+        "rerankingConfiguration": {
+            "type": "BEDROCK_RERANKING_MODEL",
+            "bedrockRerankingConfiguration": {
+                "modelConfiguration": {"modelArn": model_arn},
+            },
+        },
+    }
+
+    if top_n is not None:
+        request_params["rerankingConfiguration"][
+            "bedrockRerankingConfiguration"
+        ]["numberOfResults"] = top_n
+
+    if extra_body:
+        request_params["rerankingConfiguration"][
+            "bedrockRerankingConfiguration"
+        ]["modelConfiguration"]["additionalModelRequestFields"] = extra_body
+
+    session = aioboto3.Session()
+    all_results = []
+
+    async with session.client(
+        "bedrock-agent-runtime", region_name=region
+    ) as client:
+        next_token = None
+        while True:
+            if next_token:
+                request_params["nextToken"] = next_token
+            response = await client.rerank(**request_params)
+            for r in response.get("results", []):
+                all_results.append(
+                    {"index": r["index"], "relevance_score": r["relevanceScore"]}
+                )
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+    # Sort by relevance descending
+    all_results.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return all_results
+
+
 """Please run this test as a module:
 python -m lightrag.rerank
 """

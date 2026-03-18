@@ -8,6 +8,7 @@ import pipmaster as pm  # Pipmaster for dynamic library install
 if not pm.is_installed("aioboto3"):
     pm.install("aioboto3")
 import aioboto3
+from botocore.config import Config as BotoConfig
 import numpy as np
 from tenacity import (
     retry,
@@ -233,7 +234,8 @@ async def bedrock_complete_if_cache(
 
             # Create the client outside the generator to ensure it stays open
             client = await session.client(
-                "bedrock-runtime", region_name=region
+                "bedrock-runtime", region_name=region,
+                config=BotoConfig(read_timeout=300),
             ).__aenter__()
             event_stream = None
             iteration_started = False
@@ -307,7 +309,8 @@ async def bedrock_complete_if_cache(
     # For non-streaming responses, use the standard async context manager pattern
     session = aioboto3.Session()
     async with session.client(
-        "bedrock-runtime", region_name=region
+        "bedrock-runtime", region_name=region,
+        config=BotoConfig(read_timeout=300),
     ) as bedrock_async_client:
         try:
             # Use converse for non-streaming responses
@@ -383,7 +386,8 @@ async def bedrock_embed(
 
     session = aioboto3.Session()
     async with session.client(
-        "bedrock-runtime", region_name=region
+        "bedrock-runtime", region_name=region,
+        config=BotoConfig(read_timeout=300),
     ) as bedrock_async_client:
         try:
             if (model_provider := model.split(".")[0]) == "amazon":
