@@ -185,6 +185,7 @@ async def bedrock_complete_if_cache(
         "top_logprobs",
         "max_completion_tokens",
         "response_format",
+        "keyword_extraction",
     ]:
         kwargs.pop(k, None)
     # Fix message history format

@@ -2588,35 +2588,26 @@ async def merge_nodes_and_edges(
     # Execute entity tasks with error handling
     processed_entities = []
     if entity_tasks:
-        done, pending = await asyncio.wait(
-            entity_tasks, return_when=asyncio.FIRST_EXCEPTION
+        done, _ = await asyncio.wait(
+            entity_tasks, return_when=asyncio.ALL_COMPLETED
         )
 
-        first_exception = None
-        processed_entities = []
+        failed_entities = 0
 
         for task in done:
             try:
                 result = task.result()
             except BaseException as e:
-                if first_exception is None:
-                    first_exception = e
+                failed_entities += 1
+                logger.error(f"Entity merge failed: {e}")
             else:
                 processed_entities.append(result)
 
-        if pending:
-            for task in pending:
-                task.cancel()
-            pending_results = await asyncio.gather(*pending, return_exceptions=True)
-            for result in pending_results:
-                if isinstance(result, BaseException):
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    processed_entities.append(result)
-
-        if first_exception is not None:
-            raise first_exception
+        if failed_entities:
+            logger.warning(
+                f"Entity merging: {failed_entities}/{len(entity_tasks)} failed, "
+                f"{len(processed_entities)}/{len(entity_tasks)} succeeded"
+            )
 
     # ===== Phase 2: Process all relationships concurrently =====
     log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})"
@@ -2704,39 +2695,28 @@ async def merge_nodes_and_edges(
     all_added_entities = []
 
     if edge_tasks:
-        done, pending = await asyncio.wait(
-            edge_tasks, return_when=asyncio.FIRST_EXCEPTION
+        done, _ = await asyncio.wait(
+            edge_tasks, return_when=asyncio.ALL_COMPLETED
         )
 
-        first_exception = None
+        failed_edges = 0
 
         for task in done:
             try:
                 edge_data, added_entities = task.result()
             except BaseException as e:
-                if first_exception is None:
-                    first_exception = e
+                failed_edges += 1
+                logger.error(f"Edge merge failed: {e}")
             else:
                 if edge_data is not None:
                     processed_edges.append(edge_data)
                 all_added_entities.extend(added_entities)
 
-        if pending:
-            for task in pending:
-                task.cancel()
-            pending_results = await asyncio.gather(*pending, return_exceptions=True)
-            for result in pending_results:
-                if isinstance(result, BaseException):
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    edge_data, added_entities = result
-                    if edge_data is not None:
-                        processed_edges.append(edge_data)
-                    all_added_entities.extend(added_entities)
-
-        if first_exception is not None:
-            raise first_exception
+        if failed_edges:
+            logger.warning(
+                f"Edge merging: {failed_edges}/{len(edge_tasks)} failed, "
+                f"{len(processed_edges)}/{len(edge_tasks)} succeeded"
+            )
 
     # ===== Phase 3: Update full_entities and full_relations storage =====
     if full_entities_storage and full_relations_storage and doc_id:
@@ -3039,45 +3019,38 @@ async def extract_entities(
         task = asyncio.create_task(_process_with_semaphore(c))
         tasks.append(task)
 
-    # Wait for tasks to complete or for the first exception to occur
-    # This allows us to cancel remaining tasks if any task fails
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    # Wait for ALL tasks to complete — don't abort the whole document on a
+    # single chunk failure.  Transient LLM errors (empty response, timeout,
+    # expired token on one call) should only skip the affected chunk.
+    done, _ = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
 
-    # Check if any task raised an exception and ensure all exceptions are retrieved
-    first_exception = None
     chunk_results = []
+    failed_chunks = 0
 
     for task in done:
         try:
-            exception = task.exception()
-            if exception is not None:
-                if first_exception is None:
-                    first_exception = exception
+            exc = task.exception()
+            if exc is not None:
+                failed_chunks += 1
+                logger.error(f"Failed to extract entities and relationships: {exc}")
             else:
                 chunk_results.append(task.result())
         except Exception as e:
-            if first_exception is None:
-                first_exception = e
+            failed_chunks += 1
+            logger.error(f"Failed to extract entities and relationships: {e}")
 
-    # If any task failed, cancel all pending tasks and raise the first exception
-    if first_exception is not None:
-        # Cancel all pending tasks
-        for pending_task in pending:
-            pending_task.cancel()
+    if failed_chunks:
+        logger.warning(
+            f"Entity extraction: {failed_chunks}/{total_chunks} chunks failed, "
+            f"{len(chunk_results)}/{total_chunks} succeeded"
+        )
 
-        # Wait for cancellation to complete
-        if pending:
-            await asyncio.wait(pending)
+    # If ALL chunks failed, raise so the document is marked failed
+    if not chunk_results:
+        raise RuntimeError(
+            f"All {total_chunks} chunks failed entity extraction"
+        )
 
-        # Add progress prefix to the exception message
-        progress_prefix = f"C[{processed_chunks + 1}/{total_chunks}]"
-
-        # Re-raise the original exception with a prefix
-        prefixed_exception = create_prefixed_exception(first_exception, progress_prefix)
-        raise prefixed_exception from first_exception
-
-    # If all tasks completed successfully, chunk_results already contains the results
-    # Return the chunk_results for later processing in merge_nodes_and_edges
     return chunk_results
 
 
@@ -3662,10 +3635,10 @@ async def _perform_kg_search(
             relation = local_relations[i]
             # Build relation unique identifier
             if "src_tgt" in relation:
-                rel_key = tuple(sorted(relation["src_tgt"]))
+                rel_key = tuple(sorted(relation["src_tgt"], key=str))
             else:
                 rel_key = tuple(
-                    sorted([relation.get("src_id"), relation.get("tgt_id")])
+                    sorted([relation.get("src_id"), relation.get("tgt_id")], key=str)
                 )
 
             if rel_key not in seen_relations:
@@ -3677,10 +3650,10 @@ async def _perform_kg_search(
             relation = global_relations[i]
             # Build relation unique identifier
             if "src_tgt" in relation:
-                rel_key = tuple(sorted(relation["src_tgt"]))
+                rel_key = tuple(sorted(relation["src_tgt"], key=str))
             else:
                 rel_key = tuple(
-                    sorted([relation.get("src_id"), relation.get("tgt_id")])
+                    sorted([relation.get("src_id"), relation.get("tgt_id")], key=str)
                 )
 
             if rel_key not in seen_relations:
@@ -4350,7 +4323,7 @@ async def _find_most_related_edges_from_entities(
     for node_name in node_names:
         this_edges = batch_edges_dict.get(node_name, [])
         for e in this_edges:
-            sorted_edge = tuple(sorted(e))
+            sorted_edge = tuple(sorted(e, key=str))
             if sorted_edge not in seen:
                 seen.add(sorted_edge)
                 all_edges.append(sorted_edge)
@@ -4377,6 +4350,11 @@ async def _find_most_related_edges_from_entities(
                     f"Edge {pair} missing 'weight' attribute, using default value 1.0"
                 )
                 edge_props["weight"] = 1.0
+            else:
+                try:
+                    edge_props["weight"] = float(edge_props["weight"])
+                except (ValueError, TypeError):
+                    edge_props["weight"] = 1.0
 
             combined = {
                 "src_tgt": pair,
@@ -4386,7 +4364,7 @@ async def _find_most_related_edges_from_entities(
             all_edges_data.append(combined)
 
     all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        all_edges_data, key=lambda x: (float(x.get("rank", 0)), float(x.get("weight", 1.0))), reverse=True
     )
 
     return all_edges_data
@@ -4675,10 +4653,10 @@ async def _find_related_text_unit_from_relations(
             if chunks:
                 # Build relation identifier
                 if "src_tgt" in relation:
-                    rel_key = tuple(sorted(relation["src_tgt"]))
+                    rel_key = tuple(sorted(relation["src_tgt"], key=str))
                 else:
                     rel_key = tuple(
-                        sorted([relation.get("src_id"), relation.get("tgt_id")])
+                        sorted([relation.get("src_id"), relation.get("tgt_id")], key=str)
                     )
 
                 relations_with_chunks.append(

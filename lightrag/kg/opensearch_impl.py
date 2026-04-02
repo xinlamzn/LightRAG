@@ -1245,7 +1245,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-(c:Entity) "
-                "RETURN n.entity_id AS src, c.entity_id AS tgt",
+                "RETURN n.entity_name AS src, c.entity_name AS tgt",
                 {"id": source_node_id},
             )
             rows = self._cypher_rows(resp)
@@ -1263,7 +1263,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             resp = await self._execute_cypher(
                 "UNWIND $ids AS id "
                 "MATCH (n:Entity {entity_id: id}) "
-                "RETURN n.entity_id AS eid, properties(n) AS props",
+                "RETURN n.entity_name AS eid, properties(n) AS props",
                 {"ids": node_ids},
             )
             result = {}
@@ -1290,8 +1290,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (n:Entity)-[r:DIRECTED]-() "
-                "WHERE n.entity_id IN $ids "
-                "RETURN n.entity_id AS eid, count(r) AS degree",
+                "WHERE n.entity_name IN $ids "
+                "RETURN n.entity_name AS eid, count(r) AS degree",
                 {"ids": node_ids},
             )
             for row in self._cypher_rows(resp):
@@ -1326,8 +1326,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (n:Entity)-[r:DIRECTED]-(c:Entity) "
-                "WHERE n.entity_id IN $ids "
-                "RETURN n.entity_id AS src, c.entity_id AS tgt",
+                "WHERE n.entity_name IN $ids "
+                "RETURN n.entity_name AS src, c.entity_name AS tgt",
                 {"ids": node_ids},
             )
             for row in self._cypher_rows(resp):
@@ -1341,7 +1341,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 try:
                     resp = await self._execute_cypher(
                         "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-(c:Entity) "
-                        "RETURN n.entity_id AS src, c.entity_id AS tgt",
+                        "RETURN n.entity_name AS src, c.entity_name AS tgt",
                         {"id": nid},
                         retries=0,
                     )
@@ -1372,9 +1372,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         result = {}
         try:
             resp = await self._execute_cypher(
-                "MATCH (a:Entity)-[r:DIRECTED]-(b:Entity) "
-                "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
-                "RETURN a.entity_id, b.entity_id, properties(r)",
+                "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
+                "WHERE a.entity_name IN $ids AND b.entity_name IN $ids "
+                "RETURN a.entity_name, b.entity_name, properties(r)",
                 {"ids": all_ids},
             )
             for row in self._cypher_rows(resp):
@@ -1604,7 +1604,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             return []
         try:
             resp = await self._execute_cypher(
-                "MATCH (n:Entity) RETURN n.entity_id AS eid ORDER BY eid"
+                "MATCH (n:Entity) RETURN n.entity_name AS eid ORDER BY eid"
             )
             return [
                 r[0]
@@ -1715,7 +1715,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "OPTIONAL MATCH (n)-[r:DIRECTED]-() "
                 "WITH n, count(r) AS deg "
                 "ORDER BY deg DESC LIMIT $max "
-                "RETURN n.entity_id AS eid, properties(n) AS props",
+                "RETURN n.entity_name AS eid, properties(n) AS props",
                 {"max": max_nodes},
             )
             rows = self._cypher_rows(resp)
@@ -1739,8 +1739,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             if node_ids:
                 edge_resp = await self._execute_cypher(
                     "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
-                    "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
-                    "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                    "WHERE a.entity_name IN $ids AND b.entity_name IN $ids "
+                    "RETURN a.entity_name AS src, b.entity_name AS tgt, properties(r) AS props",
                     {"ids": node_ids},
                 )
                 for row in self._cypher_rows(edge_resp):
@@ -1763,7 +1763,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             "CALL apoc.path.subgraphNodes(start, "
             "{maxLevel: $depth, relationshipFilter: 'DIRECTED'}) YIELD node "
             "WITH node LIMIT $max "
-            "RETURN node.entity_id AS eid, properties(node) AS props",
+            "RETURN node.entity_name AS eid, properties(node) AS props",
             {"id": start_label, "depth": max_depth, "max": max_nodes},
         )
         rows = self._cypher_rows(resp)
@@ -1782,8 +1782,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if node_ids:
             edge_resp = await self._execute_cypher(
                 "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
-                "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
-                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                "WHERE a.entity_name IN $ids AND b.entity_name IN $ids "
+                "RETURN a.entity_name AS src, b.entity_name AS tgt, properties(r) AS props",
                 {"ids": node_ids},
             )
             for row in self._cypher_rows(edge_resp):
@@ -1805,7 +1805,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             f"MATCH path = (start)-[:DIRECTED*1..{max_depth}]-(c:Entity) "
             "UNWIND nodes(path) AS n "
             "WITH DISTINCT n LIMIT $max "
-            "RETURN n.entity_id AS eid, properties(n) AS props",
+            "RETURN n.entity_name AS eid, properties(n) AS props",
             {"id": start_label, "max": max_nodes},
         )
         rows = self._cypher_rows(resp)
@@ -1833,8 +1833,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if node_ids:
             edge_resp = await self._execute_cypher(
                 "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
-                "WHERE a.entity_id IN $ids AND b.entity_id IN $ids "
-                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                "WHERE a.entity_name IN $ids AND b.entity_name IN $ids "
+                "RETURN a.entity_name AS src, b.entity_name AS tgt, properties(r) AS props",
                 {"ids": node_ids},
             )
             for row in self._cypher_rows(edge_resp):
@@ -1851,7 +1851,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             return []
         try:
             resp = await self._execute_cypher(
-                "MATCH (n:Entity) RETURN n.entity_id AS eid, properties(n) AS props"
+                "MATCH (n:Entity) RETURN n.entity_name AS eid, properties(n) AS props"
             )
             nodes = []
             for row in self._cypher_rows(resp):
@@ -1870,7 +1870,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
-                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props"
+                "RETURN a.entity_name AS src, b.entity_name AS tgt, properties(r) AS props"
             )
             edges = []
             for row in self._cypher_rows(resp):
@@ -1889,7 +1889,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (n:Entity)-[r:DIRECTED]-() "
-                "WITH n.entity_id AS eid, count(r) AS deg "
+                "WITH n.entity_name AS eid, count(r) AS deg "
                 "ORDER BY deg DESC LIMIT $limit "
                 "RETURN eid",
                 {"limit": limit},
@@ -1910,8 +1910,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (n:Entity) "
-                "WHERE toLower(n.entity_id) CONTAINS toLower($q) "
-                "RETURN n.entity_id AS eid LIMIT $limit",
+                "WHERE toLower(n.entity_name) CONTAINS toLower($q) "
+                "RETURN n.entity_name AS eid LIMIT $limit",
                 {"q": query, "limit": limit},
             )
             return [
@@ -2930,9 +2930,9 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
         all_rows = []
         try:
             resp = await gs._execute_cypher(
-                "MATCH (a:Entity)-[r:DIRECTED]-(b:Entity) "
-                "WHERE a.entity_id IN $entity_ids AND b.entity_id IN $entity_ids "
-                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props "
+                "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
+                "WHERE a.entity_name IN $entity_ids AND b.entity_name IN $entity_ids "
+                "RETURN a.entity_name AS src, b.entity_name AS tgt, properties(r) AS props "
                 "ORDER BY r.weight DESC "
                 "LIMIT $limit",
                 {"entity_ids": entity_ids, "limit": limit},
@@ -2943,9 +2943,9 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
             for eid in entity_ids:
                 try:
                     resp = await gs._execute_cypher(
-                        "MATCH (a:Entity {entity_id: $eid})-[r:DIRECTED]-(b:Entity) "
-                        "WHERE b.entity_id IN $entity_ids "
-                        "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props "
+                        "MATCH (a:Entity {entity_id: $eid})-[r:DIRECTED]->(b:Entity) "
+                        "WHERE b.entity_name IN $entity_ids "
+                        "RETURN a.entity_name AS src, b.entity_name AS tgt, properties(r) AS props "
                         "ORDER BY r.weight DESC LIMIT $limit",
                         {"eid": eid, "entity_ids": entity_ids, "limit": limit},
                         retries=0,
@@ -2965,7 +2965,7 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
             # Canonicalize endpoint order so the same edge always
             # produces the same id, src_id, tgt_id regardless of which
             # direction Cypher returns the undirected match.
-            canon_src, canon_tgt = sorted([src, tgt])
+            canon_src, canon_tgt = sorted([src, tgt], key=str)
             edge_key = (canon_src, canon_tgt)
             if edge_key in seen:
                 continue
@@ -2975,7 +2975,7 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
             keywords = props.get("keywords", "")
             weight = props.get("weight", 1.0)
 
-            rel_id = compute_mdhash_id(canon_src + canon_tgt, prefix="rel-")
+            rel_id = compute_mdhash_id(str(canon_src) + str(canon_tgt), prefix="rel-")
             results.append({
                 "id": rel_id,
                 "src_id": canon_src,
@@ -3047,7 +3047,7 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
         try:
             resp = await gs._execute_cypher(
                 "MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) "
-                "RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props"
+                "RETURN a.entity_name AS src, b.entity_name AS tgt, properties(r) AS props"
             )
         except Exception as e:
             logger.error(f"[{self.workspace}] client_storage fetch failed: {e}")
@@ -3058,8 +3058,8 @@ class OpenSearchGraphRelationshipAdapter(BaseVectorStorage):
             src = row[0]
             tgt = row[1]
             props = row[2] or {}
-            canon_src, canon_tgt = sorted([src, tgt])
-            rel_id = compute_mdhash_id(canon_src + canon_tgt, prefix="rel-")
+            canon_src, canon_tgt = sorted([src, tgt], key=str)
+            rel_id = compute_mdhash_id(str(canon_src) + str(canon_tgt), prefix="rel-")
             records.append({
                 "__id__": rel_id,
                 "src_id": canon_src,
