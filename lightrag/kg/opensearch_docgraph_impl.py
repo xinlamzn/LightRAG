@@ -34,7 +34,9 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
 
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         super().__init__(namespace, global_config, embedding_func, workspace)
-        # Per-document buffer: {doc_id: {chunk_id: {entities: [], relations: []}}}
+        # Use a different database name so docgraph and LPG don't collide
+        self._database_name = "docgraph-" + self._database_name
+        # Per-document buffer: {buf_key: {chunks: {chunk_id: {entities, relations}}}}
         self._doc_buffer = defaultdict(lambda: {"properties": {}, "chunks": defaultdict(lambda: {"entities": [], "relations": []})})
         self._ontology_loaded = False
 
