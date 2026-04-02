@@ -1,0 +1,266 @@
+{
+  "ontology": {
+    "name": "generic-knowledge-graph",
+    "version": "1.0.0",
+    "description": "Generic ontology for document-derived knowledge graphs. Covers common entity types and relation types across domains including research, business, news, legal, and general knowledge extraction.",
+
+    "concepts": [
+      {
+        "ontology_id": "onto:Person",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Person",
+          "description": "An individual human being — named or referenced by role.",
+          "examples": "Alice, Dr. Smith, the CEO, Hailey Johnson"
+        }
+      },
+      {
+        "ontology_id": "onto:Organization",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Organization",
+          "description": "A structured group — company, government body, NGO, team, institution.",
+          "examples": "OpenSearch Project, United Nations, Fresh Bread Inc."
+        }
+      },
+      {
+        "ontology_id": "onto:Location",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Location",
+          "description": "A geographic or virtual place — city, country, address, region, facility, URL.",
+          "examples": "San Francisco, Building 44, us-west-2, the conference room"
+        }
+      },
+      {
+        "ontology_id": "onto:Event",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Event",
+          "description": "A happening with temporal extent — meeting, incident, release, election, delivery.",
+          "examples": "Q1 board meeting, product launch, bread delivery, Thanksgiving"
+        }
+      },
+      {
+        "ontology_id": "onto:Concept",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Concept",
+          "description": "An abstract idea, theory, methodology, field of study, or domain term.",
+          "examples": "sustainability, machine learning, rational grazing, GraphRAG"
+        }
+      },
+      {
+        "ontology_id": "onto:Artifact",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Artifact",
+          "description": "A human-made object or digital creation — document, product, tool, software, dataset.",
+          "examples": "quarterly report, OpenSearch plugin, Toyota Camry, LDBC dataset"
+        }
+      },
+      {
+        "ontology_id": "onto:Method",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Method",
+          "description": "A technique, process, algorithm, or procedure.",
+          "examples": "BFS traversal, entity extraction pipeline, crop rotation, HNSW indexing"
+        }
+      },
+      {
+        "ontology_id": "onto:NaturalObject",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:NaturalObject",
+          "description": "A naturally occurring entity — species, mineral, body of water, celestial object.",
+          "examples": "varroa mite, Colorado River, oak tree, nitrogen"
+        }
+      },
+      {
+        "ontology_id": "onto:Creature",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Creature",
+          "description": "A living organism — animal, plant, microorganism (when the biological identity is salient).",
+          "examples": "honeybee, cattle, wheat, E. coli"
+        }
+      },
+      {
+        "ontology_id": "onto:Content",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Content",
+          "description": "An information artifact — publication, book, article, podcast, video, dataset.",
+          "examples": "research paper, Lenny's Podcast episode, Wikipedia article, annual report"
+        }
+      },
+      {
+        "ontology_id": "onto:Data",
+        "labels": ["OntologyConcept"],
+        "properties": {
+          "name": "onto:Data",
+          "description": "A quantitative or structured datum — metric, measurement, statistic, identifier.",
+          "examples": "p50 latency, 300K nodes, $1.2M revenue, version 3.5.0"
+        }
+      }
+    ],
+
+    "relations": [
+      {
+        "ontology_id": "onto:RELATED_TO",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:RELATED_TO",
+          "description": "Generic association when no more specific relation applies.",
+          "source_types": ["*"],
+          "target_types": ["*"]
+        }
+      },
+      {
+        "ontology_id": "onto:WORKS_AT",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:WORKS_AT",
+          "description": "Person is employed by or affiliated with an organization.",
+          "source_types": ["onto:Person"],
+          "target_types": ["onto:Organization"]
+        }
+      },
+      {
+        "ontology_id": "onto:LOCATED_IN",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:LOCATED_IN",
+          "description": "Entity is geographically or logically situated within a location.",
+          "source_types": ["onto:Person", "onto:Organization", "onto:Event", "onto:Artifact"],
+          "target_types": ["onto:Location"]
+        }
+      },
+      {
+        "ontology_id": "onto:PART_OF",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:PART_OF",
+          "description": "Entity is a component, member, or subdivision of another entity.",
+          "source_types": ["*"],
+          "target_types": ["*"]
+        }
+      },
+      {
+        "ontology_id": "onto:CREATED_BY",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:CREATED_BY",
+          "description": "Artifact, content, or method was authored or produced by a person or organization.",
+          "source_types": ["onto:Artifact", "onto:Content", "onto:Method"],
+          "target_types": ["onto:Person", "onto:Organization"]
+        }
+      },
+      {
+        "ontology_id": "onto:USES",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:USES",
+          "description": "Entity employs, applies, or depends on another entity.",
+          "source_types": ["onto:Person", "onto:Organization", "onto:Method"],
+          "target_types": ["onto:Artifact", "onto:Method", "onto:Concept"]
+        }
+      },
+      {
+        "ontology_id": "onto:KNOWS",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:KNOWS",
+          "description": "Person knows or has a social connection with another person.",
+          "source_types": ["onto:Person"],
+          "target_types": ["onto:Person"]
+        }
+      },
+      {
+        "ontology_id": "onto:PARTICIPATED_IN",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:PARTICIPATED_IN",
+          "description": "Person or organization took part in an event.",
+          "source_types": ["onto:Person", "onto:Organization"],
+          "target_types": ["onto:Event"]
+        }
+      },
+      {
+        "ontology_id": "onto:OCCURRED_AT",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:OCCURRED_AT",
+          "description": "Event took place at a location.",
+          "source_types": ["onto:Event"],
+          "target_types": ["onto:Location"]
+        }
+      },
+      {
+        "ontology_id": "onto:STUDIES",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:STUDIES",
+          "description": "Person or organization researches or investigates a concept, method, or natural object.",
+          "source_types": ["onto:Person", "onto:Organization"],
+          "target_types": ["onto:Concept", "onto:Method", "onto:NaturalObject", "onto:Creature"]
+        }
+      },
+      {
+        "ontology_id": "onto:PRODUCES",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:PRODUCES",
+          "description": "Organization or person manufactures, publishes, or generates an artifact or content.",
+          "source_types": ["onto:Person", "onto:Organization"],
+          "target_types": ["onto:Artifact", "onto:Content", "onto:Data"]
+        }
+      },
+      {
+        "ontology_id": "onto:MEASURES",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:MEASURES",
+          "description": "Data quantifies or describes an attribute of another entity.",
+          "source_types": ["onto:Data"],
+          "target_types": ["*"]
+        }
+      },
+      {
+        "ontology_id": "onto:DERIVED_FROM",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:DERIVED_FROM",
+          "description": "Entity is derived, adapted, or evolved from another entity.",
+          "source_types": ["*"],
+          "target_types": ["*"]
+        }
+      },
+      {
+        "ontology_id": "onto:IMPACTS",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:IMPACTS",
+          "description": "Entity affects, influences, or has consequences for another entity.",
+          "source_types": ["*"],
+          "target_types": ["*"]
+        }
+      },
+      {
+        "ontology_id": "onto:SUPERSEDES",
+        "labels": ["OntologyRelation"],
+        "properties": {
+          "name": "onto:SUPERSEDES",
+          "description": "Entity replaces or is a newer version of another entity.",
+          "source_types": ["onto:Artifact", "onto:Content", "onto:Method"],
+          "target_types": ["onto:Artifact", "onto:Content", "onto:Method"]
+        }
+      }
+    ]
+  },
+
+  "_comment": "To load this ontology into a docgraph database, iterate over concepts and relations and POST each to _upsert_ontology. Example: curl -X POST '.../_plugins/_graph/docgraph/{db}/_upsert_ontology' -d '{\"ontology_id\": \"onto:Person\", \"ontology_kind\": \"ontology_concept\", \"labels\": [\"OntologyConcept\"], \"properties\": {\"name\": \"onto:Person\", \"description\": \"...\"}}'",
+
+  "loader_script": "for item in ontology.concepts: POST _upsert_ontology(ontology_id=item.ontology_id, ontology_kind='ontology_concept', labels=item.labels, properties=item.properties); for item in ontology.relations: POST _upsert_ontology(ontology_id=item.ontology_id, ontology_kind='ontology_relation', labels=item.labels, properties=item.properties)"
+}

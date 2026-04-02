@@ -2789,6 +2789,10 @@ async def merge_nodes_and_edges(
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
 
+    # Docgraph: flush buffered entities/relations to the _ingest endpoint
+    if hasattr(knowledge_graph_inst, "flush_document") and doc_id:
+        await knowledge_graph_inst.flush_document(doc_id)
+
 
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],

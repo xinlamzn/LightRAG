@@ -139,6 +139,7 @@ STORAGES = {
     "OpenSearchVectorDBStorage": ".kg.opensearch_impl",
     "OpenSearchGraphVectorStorage": ".kg.opensearch_impl",
     "OpenSearchGraphRelationshipAdapter": ".kg.opensearch_impl",
+    "OpenSearchDocgraphStorage": ".kg.opensearch_docgraph_impl",
 }
 
 

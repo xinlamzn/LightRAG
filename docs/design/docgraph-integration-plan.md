@@ -62,29 +62,104 @@ Uses `docs/ontologies/generic-knowledge-graph.json`:
 
 ## Implementation Steps
 
-### Step 1: Test evidence rewriter (prerequisite)
+### Step 1: Test evidence rewriter (COMPLETED)
 
-Before writing code, validate that the docgraph engine's automatic evidence
-rewriter handles LightRAG's critical Cypher patterns. Test each pattern against
-a docgraph database with sample data.
+Tested all critical Cypher patterns against a docgraph database. Results:
 
-**Patterns to test:**
+#### Evidence rewriter behavior
 
-| Pattern | Used by |
-|---------|---------|
-| `MATCH (n:Entity {entity_id: $id}) RETURN properties(n)` | `get_node()` |
-| `MATCH (n:Entity) WHERE n.entity_name IN $ids RETURN ...` | batch lookups |
-| `MATCH (a:Entity)-[r:DIRECTED]->(b:Entity) WHERE ...` | edge queries |
-| `MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-() RETURN count(r)` | `node_degree()` |
-| `MATCH (n:Entity) RETURN count(n)` | `node_count()` |
-| `MATCH (n:Entity) RETURN n.entity_name ORDER BY eid` | `get_all_labels()` |
+| Pattern | Result | Notes |
+|---------|--------|-------|
+| `MATCH (e:Entity) RETURN e LIMIT 5` | ✅ Rewritten, 5 rows | Auto-adds `(c:Chunk)-[:MENTIONS]->` |
+| `MATCH (e:Entity) RETURN count(e)` | ✅ Rewritten, 1 row | Works |
+| `MATCH (e:Entity) WHERE e.name IN [...] RETURN e.name` | ✅ Rewritten, 3 rows | Works with WHERE |
+| `MATCH (e:Entity {entity_id: ...})` | ✅ Rewritten, 0 rows | Rewritten but `entity_id` field doesn't exist |
+| `MATCH (a:Entity)-[r:DIRECTED]->(b:Entity)` | ❌ HTTP 400 | `DIRECTED` edge type doesn't exist; rewriter can't help |
+| `MATCH (e:Entity {entity_id: ...})-[r]-() RETURN count(r)` | ❌ HTTP 400 | Rejected (entity with edge pattern, no mediator) |
+| `MATCH (d:Document) RETURN d` | ✅ Direct, works | Not evidence-gated |
+| `MATCH (c:Chunk) RETURN c` | ✅ Direct, works | Not evidence-gated |
+| `MATCH (o:OntologyConcept) RETURN o` | ✅ Direct, works | Not evidence-gated |
 
-**Outcome:** A list of patterns that work as-is vs patterns that need explicit
-overrides with mediated queries.
+#### Docgraph data model findings
 
-**Note:** `DIRECTED` edges do not exist in docgraph — relations are stored as
-`RelFact` nodes. Any query traversing `DIRECTED` edges will need to be
-rewritten to the RelFact pattern regardless of the evidence rewriter.
+**Node structure** (from raw index documents):
+
+```
+Entity node:
+  id: "doc-001-chunk-1:alice"          (compound: {chunk_id}:{entity_id})
+  labels: ["Entity", "Person"]
+  properties: {"name": "Alice"}        (flat_object — only user properties)
+  __source_chunk_id: "doc-001-chunk-1" (top-level, NOT in properties)
+  __source_doc_id: "doc-001"           (top-level, NOT in properties)
+  __ontology_id: "onto:Person"         (top-level, NOT in properties)
+  __authz_scopes: ["scope:..."]
+  __withdrawn: false
+
+RelFact node:
+  id: "doc-001-chunk-1:rel-001"
+  labels: ["RelFact"]
+  properties: {"context": "employment"} (user properties only)
+  __ontology_id: "onto:KNOWS"           (top-level)
+  __source_chunk_id, __source_doc_id, __authz_scopes, __withdrawn
+```
+
+**Dot-notation property access** (same bug as LPG mode):
+
+| Field | `n.field` | Location | Accessible? |
+|-------|-----------|----------|-------------|
+| `name` | `e.name` → `"Alice"` | properties only | ✅ |
+| `context` | `r.context` → `"employment"` | properties only | ✅ |
+| `id` | `e.id` → `null` | top-level only | ❌ |
+| `__source_doc_id` | `e.__source_doc_id` → `null` | top-level only | ❌ |
+| `__ontology_id` | `e.__ontology_id` → `null` | top-level only | ❌ |
+
+**Edge types from Entity nodes:**
+- `SOURCE_ENTITY` → RelFact (entity is source of relation)
+- `TARGET_ENTITY` → RelFact (entity is target of relation)
+- `INSTANCE_OF` → OntologyConcept (ontology grounding)
+- No `DIRECTED` edges, no `CO_OCCURS_WITH` edges
+
+**Working query patterns for LightRAG:**
+
+```cypher
+-- Find entity by name (mediated)
+MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) WHERE e.name = 'Alice' RETURN e.name
+
+-- Find relations for entity (via RelFact)
+MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)<-[:SOURCE_ENTITY]-(r:RelFact)-[:TARGET_ENTITY]->(t:Entity)
+WHERE e.name = 'Alice' RETURN e.name, t.name, properties(r)
+
+-- Find reverse relations
+MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)<-[:TARGET_ENTITY]-(r:RelFact)-[:SOURCE_ENTITY]->(s:Entity)
+WHERE e.name = 'Alice' RETURN s.name, e.name
+
+-- Get chunk text for entity
+MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) WHERE e.name = 'Alice' RETURN c.text
+
+-- Full evidence chain
+MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(e:Entity) RETURN e.name
+
+-- Ontology grounding
+MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)-[:INSTANCE_OF]->(o:OntologyConcept) RETURN e.name, o.name
+```
+
+#### Key implications for implementation
+
+1. **No `entity_id` field** — docgraph uses `id` (the graph node key) as the
+   compound ID. But `n.id` returns null via dot-notation (same promoted-field
+   bug). Must use `properties(n)` or match by `name`.
+
+2. **No `DIRECTED` edges** — ALL edge queries must be rewritten to RelFact
+   pattern. This is the biggest change.
+
+3. **`entity_name` → `name`** — docgraph entities store name in
+   `properties.name`, not `properties.entity_name`.
+
+4. **Evidence rewriter handles simple scans** — `MATCH (e:Entity) RETURN ...`
+   works. But any pattern with entity-to-entity edges fails.
+
+5. **`_hybrid_retrieve` returned 0 results** in testing — may need embedding
+   configuration or different search_fields. Needs further investigation.
 
 ### Step 2: Ontology mapping module
 
