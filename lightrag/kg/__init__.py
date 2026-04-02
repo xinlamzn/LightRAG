@@ -17,6 +17,7 @@ STORAGE_IMPLEMENTATIONS = {
             "MongoGraphStorage",
             "MemgraphStorage",
             "OpenSearchGraphStorage",
+            "OpenSearchDocgraphStorage",
         ],
         "required_methods": ["upsert_node", "upsert_edge"],
     },

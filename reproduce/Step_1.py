@@ -35,6 +35,7 @@ EMBEDDING_MODEL = os.environ.get(
 )
 EMBEDDING_DIM = int(os.environ.get("BEDROCK_EMBEDDING_DIM", "1024"))
 EMBEDDING_MAX_TOKEN_SIZE = int(
+GRAPH_STORAGE = os.environ.get("GRAPH_STORAGE", "OpenSearchGraphStorage")
     os.environ.get("BEDROCK_EMBEDDING_MAX_TOKEN_SIZE", "8192")
 )
 
@@ -81,7 +82,7 @@ async def initialize_rag(working_dir):
         # OpenSearch-backed storages
         kv_storage="OpenSearchKVStorage",
         doc_status_storage="OpenSearchDocStatusStorage",
-        graph_storage="OpenSearchGraphStorage",
+        graph_storage=GRAPH_STORAGE,
     )
 
     await rag.initialize_storages()

@@ -68,6 +68,7 @@ EMBEDDING_MODEL = os.environ.get("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-
 # Titan Embed v2 produces 1024-dimensional vectors
 EMBEDDING_DIM = int(os.environ.get("BEDROCK_EMBEDDING_DIM", "1024"))
 EMBEDDING_MAX_TOKEN_SIZE = int(os.environ.get("BEDROCK_EMBEDDING_MAX_TOKEN_SIZE", "8192"))
+GRAPH_STORAGE = os.environ.get("GRAPH_STORAGE", "OpenSearchGraphStorage")
 
 if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)
@@ -92,7 +93,7 @@ async def initialize_rag() -> LightRAG:
         # OpenSearch-backed storages
         kv_storage="OpenSearchKVStorage",
         doc_status_storage="OpenSearchDocStatusStorage",
-        graph_storage="OpenSearchGraphStorage",
+        graph_storage=GRAPH_STORAGE,
         # vector_storage is intentionally omitted -- OpenSearchGraphStorage
         # provides implicit vector storage via the graph plugin (embeddings
         # are stored on graph nodes/edges, not in separate k-NN indices).
@@ -131,6 +132,7 @@ async def main():
         print("Initializing LightRAG with OpenSearch + Bedrock...")
         print(f"  LLM:       {LLM_MODEL}")
         print(f"  Embedding: {EMBEDDING_MODEL} (dim={EMBEDDING_DIM})")
+        print(f"  Graph:     {GRAPH_STORAGE}")
         rag = await initialize_rag()
 
         if not os.path.exists(BOOK_FILE):
