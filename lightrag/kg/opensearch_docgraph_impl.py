@@ -725,43 +725,34 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict]:
-        """Hybrid retrieval via _plugins/_graph/retrieve.
-
-        In docgraph mode, Entity nodes cannot be seeds. We seed on Chunks
-        (which have embeddings) with hops=1 to expand to mentioned Entities.
-        """
+        """Vector search via Cypher db.index.vector.queryNodes procedure."""
         gs = self._graph_storage
         await gs._ensure_database_ready()
 
         if query_embedding is not None:
-            qvec = query_embedding
+            qvec = query_embedding if isinstance(query_embedding, list) else query_embedding.tolist()
         else:
             qvec = (await self.embedding_func([query]))[0].tolist()
 
-        body = {
-            "query_vector": qvec,
-            "database": gs.database_name,
-            "seed_k": max(top_k * 2, 20),
-            "top_k": top_k * 3,  # over-fetch, filter to target label
-            "hops": 1,  # expand from Chunk seeds to Entity/RelFact neighbors
-            "weights": {"vector_weight": 1.0, "text_weight": 0.0, "graph_weight": 0.0},
-        }
-
         try:
-            resp = await self._client.transport.perform_request(
-                "POST", "/_plugins/_graph/retrieve", body=body,
+            resp = await gs._execute_cypher(
+                "CALL db.index.vector.queryNodes('embedding', $k, $vec) "
+                "YIELD node, score "
+                "WHERE $label IN labels(node) "
+                "RETURN node, score LIMIT $k",
+                {"k": top_k, "vec": qvec, "label": self._node_label},
             )
             results = []
-            for r in resp.get("results", []):
-                labels = r.get("labels", [])
-                if self._node_label not in labels:
+            for row in gs._cypher_rows(resp):
+                node = row[0]
+                if node is None:
                     continue
-                props = r.get("properties", {})
+                props = node.get("properties", {})
                 props["entity_name"] = props.get("name", "")
                 results.append(props)
-            return results[:top_k]
+            return results
         except Exception as e:
-            logger.error(f"Docgraph hybrid retrieval failed: {e}")
+            logger.error(f"Docgraph vector query failed: {e}")
             return []
 
     async def index_done_callback(self):
@@ -877,39 +868,30 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict]:
-        """Find relevant relations via hybrid retrieval over RelFact nodes."""
+        """Find relevant relations via vector search on RelFact nodes."""
         gs = self._graph_storage
         await gs._ensure_database_ready()
 
         if query_embedding is not None:
-            qvec = query_embedding
+            qvec = query_embedding if isinstance(query_embedding, list) else query_embedding.tolist()
         else:
             qvec = (await self.embedding_func([query]))[0].tolist()
 
-        body = {
-            "query_vector": qvec,
-            "database": gs.database_name,
-            "seed_k": max(top_k * 2, 20),
-            "top_k": top_k * 3,
-            "hops": 1,
-            "weights": {"vector_weight": 1.0, "text_weight": 0.0, "graph_weight": 0.0},
-        }
-
         try:
-            resp = await self._client.transport.perform_request(
-                "POST", "/_plugins/_graph/retrieve", body=body,
+            # Vector search for RelFact nodes
+            resp = await gs._execute_cypher(
+                "CALL db.index.vector.queryNodes('embedding', $k, $vec) "
+                "YIELD node, score "
+                "WHERE 'RelFact' IN labels(node) "
+                "RETURN node, score LIMIT $k",
+                {"k": top_k * 2, "vec": qvec},
             )
+            relfact_nodes = [row[0] for row in gs._cypher_rows(resp) if row[0]]
 
-            # Collect RelFact results and resolve src/tgt via Cypher
-            relfact_ids = []
-            for r in resp.get("results", []):
-                if "RelFact" in r.get("labels", []):
-                    relfact_ids.append(r.get("id"))
-
-            if not relfact_ids:
+            if not relfact_nodes:
                 return []
 
-            # Resolve source/target entity names for each RelFact
+            # Resolve source/target entity names via Cypher
             results = []
             cypher_resp = await gs._execute_cypher(
                 "MATCH (c:Chunk)-[:ASSERTS]->(r:RelFact)-[:SOURCE_ENTITY]->(a:Entity), "
