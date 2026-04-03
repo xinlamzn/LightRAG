@@ -80,11 +80,18 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
     # ── Database lifecycle ────────────────────────────────────────────
 
     async def _create_database_if_not_exists(self):
-        """Create a docgraph-mode database."""
+        """Create a docgraph-mode database with embedding config."""
+        dim = self.embedding_func.embedding_dim
         body = {
             "mode": "docgraph",
             "number_of_shards": 1,
             "number_of_replicas": 0,
+            "embedding": {
+                "dimension": dim,
+                "field": "embedding",
+                "engine": "faiss",
+                "space_type": "cosinesimil",
+            },
         }
         try:
             await self._client.transport.perform_request(
@@ -326,9 +333,13 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             ok = resp.get("success_count", 0)
             err = resp.get("error_count", 0)
             if err:
+                # Log first few errors for debugging
+                for r in resp.get("results", [])[:3]:
+                    if not r.get("updated"):
+                        logger.warning(f"  Failed: node_id={r.get('node_id')}, error={r.get('error')}")
                 logger.warning(f"bulk_update_embeddings: {ok} ok, {err} errors")
             else:
-                logger.debug(f"bulk_update_embeddings: {ok} nodes updated")
+                logger.info(f"bulk_update_embeddings: {ok} nodes updated")
         except Exception as e:
             logger.error(f"bulk_update_embeddings failed: {e}")
             if hasattr(e, 'info'):
@@ -708,7 +719,7 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
         updates = self._pending_embeddings
         self._pending_embeddings = []
         for j in range(0, len(updates), 100):
-            batch = updates[j:j + 500]
+            batch = updates[j:j + 100]
             await gs.bulk_update_embeddings(batch)
 
     async def query(
@@ -858,7 +869,7 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
         updates = self._pending_embeddings
         self._pending_embeddings = []
         for j in range(0, len(updates), 100):
-            batch = updates[j:j + 500]
+            batch = updates[j:j + 100]
             await gs.bulk_update_embeddings(batch)
 
     async def query(
