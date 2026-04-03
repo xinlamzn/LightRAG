@@ -81,7 +81,7 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
     # ── Database lifecycle ────────────────────────────────────────────
 
     async def _create_database_if_not_exists(self):
-        """Create a docgraph-mode database with embedding config."""
+        """Create a docgraph-mode database with embedding config and property schema."""
         dim = self.embedding_func.embedding_dim
         body = {
             "mode": "docgraph",
@@ -92,6 +92,15 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 "field": "embedding",
                 "engine": "faiss",
                 "space_type": "cosinesimil",
+            },
+            "schema": {
+                "nodes": {
+                    "weight": {"type": "float"},
+                    "description": {"type": "text"},
+                    "keywords": {"type": "text"},
+                    "entity_type": {"type": "keyword"},
+                },
+                "strict": False,
             },
         }
         try:
@@ -220,7 +229,7 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             "properties": {
                 "description": edge_data.get("description", ""),
                 "keywords": keywords,
-                "weight": str(edge_data.get("weight", 1.0)),
+                "weight": float(edge_data.get("weight", 1.0)),
             },
             "ontology_id": ontology_id,
         }
