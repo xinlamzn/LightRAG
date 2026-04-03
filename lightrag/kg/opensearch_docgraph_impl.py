@@ -12,10 +12,12 @@ Key differences from LPG mode:
 - Ontology grounding links entities/relations to OntologyConcept/OntologyRelation
 """
 
+import asyncio
 import logging
 import os
 from collections import defaultdict
 
+from lightrag.base import BaseVectorStorage
 from lightrag.kg.opensearch_impl import (
     OpenSearchGraphStorage,
     _get_opensearch_env,
@@ -276,6 +278,42 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             raise
         finally:
             del self._doc_buffer[buf_key]
+
+    # ── Embedding updates via _bulk_update_nodes ────────────────────────
+
+    async def bulk_update_embeddings(
+        self, updates: list[dict]
+    ) -> None:
+        """Update embeddings on existing docgraph nodes via _bulk_update_nodes.
+
+        Args:
+            updates: List of {"node_id": str, "target_kind": str, "embedding": list[float]}
+        """
+        if not updates:
+            return
+        endpoint = f"/_plugins/_graph/docgraph/{self._database_name}/_bulk_update_nodes"
+        payload = {
+            "updates": [
+                {
+                    "node_id": u["node_id"],
+                    "target_kind": u["target_kind"],
+                    "set": {"embedding": u["embedding"]},
+                }
+                for u in updates
+            ]
+        }
+        try:
+            resp = await self._client.transport.perform_request(
+                "POST", endpoint, body=payload,
+            )
+            ok = resp.get("success_count", 0)
+            err = resp.get("error_count", 0)
+            if err:
+                logger.warning(f"bulk_update_embeddings: {ok} ok, {err} errors")
+            else:
+                logger.debug(f"bulk_update_embeddings: {ok} nodes updated")
+        except Exception as e:
+            logger.error(f"bulk_update_embeddings failed: {e}")
 
     # ── Read queries (evidence-mediated) ──────────────────────────────
 
@@ -559,3 +597,298 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
 
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
         logger.warning("remove_edges not supported in docgraph mode")
+
+
+# ── Docgraph-aware VDB and Relationship Adapter ──────────────────────
+
+
+class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
+    """Vector storage for docgraph mode.
+
+    Instead of Cypher MERGE to create nodes + bulk update for embeddings,
+    this class uses _bulk_update_nodes to write embeddings to entities/chunks
+    that were already created by _ingest. Queries use the same hybrid
+    retrieval endpoint.
+    """
+
+    _graph_storage: "OpenSearchDocgraphStorage" = None
+    _client = None
+    _node_label: str = "Entity"
+    _max_batch_size: int = 50
+
+    def __init__(
+        self,
+        namespace,
+        workspace,
+        embedding_func,
+        meta_fields=None,
+        node_label="Entity",
+        graph_storage=None,
+        global_config=None,
+        **kwargs,
+    ):
+        super().__init__(
+            namespace=namespace,
+            global_config=global_config or {},
+        )
+        self.workspace = workspace
+        self.embedding_func = embedding_func
+        self.meta_fields = meta_fields or set()
+        self._node_label = node_label
+        self._graph_storage = graph_storage
+        if graph_storage is not None:
+            self._client = graph_storage.client
+        self.cosine_better_than_threshold = 0.2
+
+    async def upsert(self, data: dict[str, dict]) -> None:
+        """Compute embeddings and write them to existing docgraph nodes."""
+        if not data:
+            return
+
+        gs = self._graph_storage
+        await gs._ensure_database_ready()
+
+        import numpy as np
+
+        # Compute embeddings
+        items = list(data.items())
+        contents = [d.get("content", "") for _, d in items]
+        batches = [
+            contents[i : i + self._max_batch_size]
+            for i in range(0, len(contents), self._max_batch_size)
+        ]
+        embeddings_list = await asyncio.gather(
+            *[self.embedding_func(batch) for batch in batches]
+        )
+        embeddings = np.concatenate(embeddings_list)
+
+        # Build bulk update payload
+        # Entity node_id in docgraph = "{chunk_id}:{entity_id}"
+        # We need to find the right node_id for each entity
+        target_kind = "entity" if self._node_label == "Entity" else "chunk"
+        updates = []
+
+        for i, (doc_id, doc_data) in enumerate(items):
+            if i >= len(embeddings):
+                break
+
+            if self._node_label == "Entity":
+                entity_name = doc_data.get("entity_name", doc_id)
+                source_id = doc_data.get("source_id", "")
+                chunk_ids = [c.strip() for c in source_id.split("<SEP>") if c.strip()] if source_id else []
+                chunk_id = chunk_ids[0] if chunk_ids else "unknown-chunk"
+                node_id = f"{chunk_id}:{entity_name}"
+            else:
+                # Chunk nodes: node_id = chunk_id
+                node_id = doc_id
+
+            updates.append({
+                "node_id": node_id,
+                "target_kind": target_kind,
+                "embedding": embeddings[i].tolist(),
+            })
+
+        if updates:
+            # Send in batches of 500 (API limit)
+            for j in range(0, len(updates), 500):
+                batch = updates[j:j + 500]
+                await gs.bulk_update_embeddings(batch)
+
+    async def query(
+        self, query: str, top_k: int, query_embedding: list[float] = None
+    ) -> list[dict]:
+        """Hybrid retrieval via _plugins/_graph/retrieve."""
+        gs = self._graph_storage
+        await gs._ensure_database_ready()
+
+        if query_embedding is not None:
+            qvec = query_embedding
+        else:
+            qvec = (await self.embedding_func([query]))[0].tolist()
+
+        body = {
+            "query_vector": qvec,
+            "query_text": query,
+            "database": gs.database_name,
+            "seed_k": max(top_k, 10),
+            "top_k": top_k,
+            "hops": 0,
+            "search_fields": ["properties.name", "properties.description"],
+            "weights": {"vector_weight": 0.7, "text_weight": 0.3, "graph_weight": 0.0},
+        }
+
+        try:
+            resp = await self._client.transport.perform_request(
+                "POST", "/_plugins/_graph/retrieve", body=body,
+            )
+            results = []
+            for r in resp.get("results", []):
+                labels = r.get("labels", [])
+                if self._node_label not in labels:
+                    continue
+                props = r.get("properties", {})
+                props["entity_name"] = props.get("name", "")
+                results.append(props)
+            return results[:top_k]
+        except Exception as e:
+            logger.error(f"Docgraph hybrid retrieval failed: {e}")
+            return []
+
+    async def index_done_callback(self):
+        pass
+
+    async def delete_by_ids(self, ids: list[str]) -> None:
+        pass
+
+    async def drop(self) -> dict[str, str]:
+        return {"status": "success"}
+
+
+class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
+    """Relationship adapter for docgraph mode.
+
+    Scans RelFact nodes instead of DIRECTED edges. Uses hybrid retrieval
+    to find relevant relations by embedding similarity.
+    """
+
+    _graph_storage: "OpenSearchDocgraphStorage" = None
+    _client = None
+    _entities_vdb: OpenSearchDocgraphVectorStorage = None
+    _max_batch_size: int = 50
+
+    def __init__(
+        self,
+        namespace,
+        workspace,
+        embedding_func,
+        meta_fields=None,
+        entities_vdb=None,
+        graph_storage=None,
+        global_config=None,
+        **kwargs,
+    ):
+        super().__init__(
+            namespace=namespace,
+            global_config=global_config or {},
+        )
+        self.workspace = workspace
+        self.embedding_func = embedding_func
+        self.meta_fields = meta_fields or set()
+        self._entities_vdb = entities_vdb
+        self._graph_storage = graph_storage
+        if graph_storage is not None:
+            self._client = graph_storage.client
+        self.cosine_better_than_threshold = 0.2
+
+    async def upsert(self, data: dict[str, dict]) -> None:
+        """Compute embeddings for RelFact nodes and update them."""
+        if not data:
+            return
+
+        gs = self._graph_storage
+        await gs._ensure_database_ready()
+
+        import numpy as np
+
+        items = list(data.items())
+        contents = [d.get("content", "") for _, d in items]
+        batches = [
+            contents[i : i + self._max_batch_size]
+            for i in range(0, len(contents), self._max_batch_size)
+        ]
+        embeddings_list = await asyncio.gather(
+            *[self.embedding_func(batch) for batch in batches]
+        )
+        embeddings = np.concatenate(embeddings_list)
+
+        updates = []
+        for i, (doc_id, doc_data) in enumerate(items):
+            if i >= len(embeddings):
+                break
+            src = doc_data.get("src_id", "")
+            tgt = doc_data.get("tgt_id", "")
+            source_id = doc_data.get("source_id", "")
+            chunk_ids = [c.strip() for c in source_id.split("<SEP>") if c.strip()] if source_id else []
+            chunk_id = chunk_ids[0] if chunk_ids else "unknown-chunk"
+            # RelFact node_id = "{chunk_id}:{src}--{tgt}"
+            node_id = f"{chunk_id}:{src}--{tgt}"
+            updates.append({
+                "node_id": node_id,
+                "target_kind": "rel_fact",
+                "embedding": embeddings[i].tolist(),
+            })
+
+        if updates:
+            for j in range(0, len(updates), 500):
+                batch = updates[j:j + 500]
+                await gs.bulk_update_embeddings(batch)
+
+    async def query(
+        self, query: str, top_k: int, query_embedding: list[float] = None
+    ) -> list[dict]:
+        """Find relevant relations via hybrid retrieval over RelFact nodes."""
+        gs = self._graph_storage
+        await gs._ensure_database_ready()
+
+        if query_embedding is not None:
+            qvec = query_embedding
+        else:
+            qvec = (await self.embedding_func([query]))[0].tolist()
+
+        body = {
+            "query_vector": qvec,
+            "query_text": query,
+            "database": gs.database_name,
+            "seed_k": max(top_k, 10),
+            "top_k": top_k * 2,  # over-fetch, filter to RelFact
+            "hops": 1,  # expand to get source/target entities
+            "search_fields": ["properties.description", "properties.keywords"],
+            "weights": {"vector_weight": 0.7, "text_weight": 0.3, "graph_weight": 0.0},
+        }
+
+        try:
+            resp = await self._client.transport.perform_request(
+                "POST", "/_plugins/_graph/retrieve", body=body,
+            )
+
+            # Collect RelFact results and resolve src/tgt via Cypher
+            relfact_ids = []
+            for r in resp.get("results", []):
+                if "RelFact" in r.get("labels", []):
+                    relfact_ids.append(r.get("id"))
+
+            if not relfact_ids:
+                return []
+
+            # Resolve source/target entity names for each RelFact
+            results = []
+            cypher_resp = await gs._execute_cypher(
+                "MATCH (c:Chunk)-[:ASSERTS]->(r:RelFact)-[:SOURCE_ENTITY]->(a:Entity), "
+                "(r)-[:TARGET_ENTITY]->(b:Entity) "
+                "RETURN a.name AS src, b.name AS tgt, properties(r) AS props "
+                "LIMIT $limit",
+                {"limit": top_k},
+            )
+            for row in gs._cypher_rows(cypher_resp):
+                src, tgt, props = row[0], row[1], row[2] or {}
+                results.append({
+                    "src_id": str(src),
+                    "tgt_id": str(tgt),
+                    "content": props.get("description", ""),
+                    "source_id": props.get("source_id", ""),
+                    **props,
+                })
+
+            return results[:top_k]
+        except Exception as e:
+            logger.error(f"Docgraph relationship query failed: {e}")
+            return []
+
+    async def index_done_callback(self):
+        pass
+
+    async def delete_by_ids(self, ids: list[str]) -> None:
+        pass
+
+    async def drop(self) -> dict[str, str]:
+        return {"status": "success"}

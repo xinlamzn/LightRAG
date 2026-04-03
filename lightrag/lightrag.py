@@ -660,6 +660,7 @@ class LightRAG:
 
         # Check if graph plugin provides implicit vector storage
         _use_graph_plugin_vdb = False
+        _use_docgraph_vdb = False
         try:
             from lightrag.kg.opensearch_impl import (
                 OpenSearchGraphStorage as _OSGraphStorage,
@@ -673,10 +674,47 @@ class LightRAG:
                         f"Ignoring vector_storage={self.vector_storage!r}; "
                         "graph plugin provides implicit vector storage"
                     )
+            # Check if it's specifically docgraph mode
+            try:
+                from lightrag.kg.opensearch_docgraph_impl import (
+                    OpenSearchDocgraphStorage as _OSDocgraphStorage,
+                    OpenSearchDocgraphVectorStorage as _OSDocgraphVectorStorage,
+                    OpenSearchDocgraphRelationshipAdapter as _OSDocgraphRelAdapter,
+                )
+                if isinstance(self.chunk_entity_relation_graph, _OSDocgraphStorage):
+                    _use_docgraph_vdb = True
+            except ImportError:
+                pass
         except ImportError:
             pass
 
-        if _use_graph_plugin_vdb:
+        if _use_docgraph_vdb:
+            graph_db = self.chunk_entity_relation_graph
+            self.entities_vdb: BaseVectorStorage = _OSDocgraphVectorStorage(
+                namespace=NameSpace.VECTOR_STORE_ENTITIES,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"entity_name", "source_id", "content", "file_path"},
+                node_label="Entity",
+                graph_storage=graph_db,
+            )
+            self.chunks_vdb: BaseVectorStorage = _OSDocgraphVectorStorage(
+                namespace=NameSpace.VECTOR_STORE_CHUNKS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"full_doc_id", "content", "file_path"},
+                node_label="Chunk",
+                graph_storage=graph_db,
+            )
+            self.relationships_vdb: BaseVectorStorage = _OSDocgraphRelAdapter(
+                namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+                entities_vdb=self.entities_vdb,
+                graph_storage=graph_db,
+            )
+        elif _use_graph_plugin_vdb:
             graph_db = self.chunk_entity_relation_graph
             self.entities_vdb: BaseVectorStorage = _OSGraphVectorStorage(
                 namespace=NameSpace.VECTOR_STORE_ENTITIES,
