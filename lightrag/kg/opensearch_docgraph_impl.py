@@ -612,7 +612,6 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
     """
 
     _graph_storage: "OpenSearchDocgraphStorage" = None
-    _client = None
     _node_label: str = "Entity"
     _max_batch_size: int = 50
 
@@ -629,24 +628,24 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
     ):
         super().__init__(
             namespace=namespace,
+            workspace=workspace,
+            embedding_func=embedding_func,
             global_config=global_config or {},
         )
-        self.workspace = workspace
-        self.embedding_func = embedding_func
         self.meta_fields = meta_fields or set()
         self._node_label = node_label
         self._graph_storage = graph_storage
-        if graph_storage is not None:
-            self._client = graph_storage.client
         self.cosine_better_than_threshold = 0.2
+        self._pending_embeddings = []
+
+    @property
+    def _client(self):
+        return self._graph_storage.client if self._graph_storage else None
 
     async def upsert(self, data: dict[str, dict]) -> None:
-        """Compute embeddings and write them to existing docgraph nodes."""
+        """Buffer embeddings — they'll be flushed after _ingest creates the nodes."""
         if not data:
             return
-
-        gs = self._graph_storage
-        await gs._ensure_database_ready()
 
         import numpy as np
 
@@ -662,16 +661,11 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
         )
         embeddings = np.concatenate(embeddings_list)
 
-        # Build bulk update payload
-        # Entity node_id in docgraph = "{chunk_id}:{entity_id}"
-        # We need to find the right node_id for each entity
+        # Buffer for later flush
         target_kind = "entity" if self._node_label == "Entity" else "chunk"
-        updates = []
-
         for i, (doc_id, doc_data) in enumerate(items):
             if i >= len(embeddings):
                 break
-
             if self._node_label == "Entity":
                 entity_name = doc_data.get("entity_name", doc_id)
                 source_id = doc_data.get("source_id", "")
@@ -679,20 +673,24 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
                 chunk_id = chunk_ids[0] if chunk_ids else "unknown-chunk"
                 node_id = f"{chunk_id}:{entity_name}"
             else:
-                # Chunk nodes: node_id = chunk_id
                 node_id = doc_id
 
-            updates.append({
+            self._pending_embeddings.append({
                 "node_id": node_id,
                 "target_kind": target_kind,
                 "embedding": embeddings[i].tolist(),
             })
 
-        if updates:
-            # Send in batches of 500 (API limit)
-            for j in range(0, len(updates), 500):
-                batch = updates[j:j + 500]
-                await gs.bulk_update_embeddings(batch)
+    async def flush_embeddings(self) -> None:
+        """Write all buffered embeddings to docgraph nodes via _bulk_update_nodes."""
+        if not self._pending_embeddings or not self._graph_storage:
+            return
+        gs = self._graph_storage
+        updates = self._pending_embeddings
+        self._pending_embeddings = []
+        for j in range(0, len(updates), 500):
+            batch = updates[j:j + 500]
+            await gs.bulk_update_embeddings(batch)
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
@@ -740,6 +738,24 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
     async def delete_by_ids(self, ids: list[str]) -> None:
         pass
 
+    async def delete_entity(self, entity_name: str) -> None:
+        pass
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        pass
+
+    async def get_by_id(self, id: str):
+        return None
+
+    async def get_by_ids(self, ids: list[str]):
+        return []
+
+    async def delete(self, ids: list[str]):
+        pass
+
+    async def get_vectors_by_ids(self, ids: list[str]):
+        return {}
+
     async def drop(self) -> dict[str, str]:
         return {"status": "success"}
 
@@ -752,7 +768,6 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
     """
 
     _graph_storage: "OpenSearchDocgraphStorage" = None
-    _client = None
     _entities_vdb: OpenSearchDocgraphVectorStorage = None
     _max_batch_size: int = 50
 
@@ -769,24 +784,24 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
     ):
         super().__init__(
             namespace=namespace,
+            workspace=workspace,
+            embedding_func=embedding_func,
             global_config=global_config or {},
         )
-        self.workspace = workspace
-        self.embedding_func = embedding_func
         self.meta_fields = meta_fields or set()
         self._entities_vdb = entities_vdb
         self._graph_storage = graph_storage
-        if graph_storage is not None:
-            self._client = graph_storage.client
         self.cosine_better_than_threshold = 0.2
+        self._pending_embeddings = []
+
+    @property
+    def _client(self):
+        return self._graph_storage.client if self._graph_storage else None
 
     async def upsert(self, data: dict[str, dict]) -> None:
-        """Compute embeddings for RelFact nodes and update them."""
+        """Buffer embeddings for RelFact nodes."""
         if not data:
             return
-
-        gs = self._graph_storage
-        await gs._ensure_database_ready()
 
         import numpy as np
 
@@ -801,7 +816,6 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
         )
         embeddings = np.concatenate(embeddings_list)
 
-        updates = []
         for i, (doc_id, doc_data) in enumerate(items):
             if i >= len(embeddings):
                 break
@@ -810,18 +824,23 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
             source_id = doc_data.get("source_id", "")
             chunk_ids = [c.strip() for c in source_id.split("<SEP>") if c.strip()] if source_id else []
             chunk_id = chunk_ids[0] if chunk_ids else "unknown-chunk"
-            # RelFact node_id = "{chunk_id}:{src}--{tgt}"
             node_id = f"{chunk_id}:{src}--{tgt}"
-            updates.append({
+            self._pending_embeddings.append({
                 "node_id": node_id,
                 "target_kind": "rel_fact",
                 "embedding": embeddings[i].tolist(),
             })
 
-        if updates:
-            for j in range(0, len(updates), 500):
-                batch = updates[j:j + 500]
-                await gs.bulk_update_embeddings(batch)
+    async def flush_embeddings(self) -> None:
+        """Write all buffered embeddings to RelFact nodes."""
+        if not self._pending_embeddings or not self._graph_storage:
+            return
+        gs = self._graph_storage
+        updates = self._pending_embeddings
+        self._pending_embeddings = []
+        for j in range(0, len(updates), 500):
+            batch = updates[j:j + 500]
+            await gs.bulk_update_embeddings(batch)
 
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
@@ -889,6 +908,24 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
 
     async def delete_by_ids(self, ids: list[str]) -> None:
         pass
+
+    async def delete_entity(self, entity_name: str) -> None:
+        pass
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        pass
+
+    async def get_by_id(self, id: str):
+        return None
+
+    async def get_by_ids(self, ids: list[str]):
+        return []
+
+    async def delete(self, ids: list[str]):
+        pass
+
+    async def get_vectors_by_ids(self, ids: list[str]):
+        return {}
 
     async def drop(self) -> dict[str, str]:
         return {"status": "success"}
