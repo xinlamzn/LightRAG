@@ -80,6 +80,7 @@ if not os.path.exists(WORKING_DIR):
 async def initialize_rag() -> LightRAG:
     rag = LightRAG(
         working_dir=WORKING_DIR,
+        workspace="demo",
         # Bedrock LLM — llm_model_name is passed as the Bedrock model ID
         llm_model_func=bedrock_complete,
         llm_model_name=LLM_MODEL,

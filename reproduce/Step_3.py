@@ -89,6 +89,7 @@ async def run_queries_and_save_to_json(
 async def initialize_rag(working_dir):
     rag = LightRAG(
         working_dir=working_dir,
+        workspace=os.path.basename(working_dir),
         llm_model_func=bedrock_complete,
         llm_model_name=LLM_MODEL,
         llm_model_kwargs={"max_tokens": 4096},
