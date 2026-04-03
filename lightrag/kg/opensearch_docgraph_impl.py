@@ -738,7 +738,7 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
             resp = await gs._execute_cypher(
                 "CALL db.index.vector.queryNodes('embedding', $k, $vec) "
                 "YIELD node, score "
-                "WHERE $label IN labels(node) "
+                "WITH node, score WHERE $label IN labels(node) "
                 "RETURN node, score LIMIT $k",
                 {"k": top_k, "vec": qvec, "label": self._node_label},
             )
@@ -882,7 +882,7 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
             resp = await gs._execute_cypher(
                 "CALL db.index.vector.queryNodes('embedding', $k, $vec) "
                 "YIELD node, score "
-                "WHERE 'RelFact' IN labels(node) "
+                "WITH node, score WHERE 'RelFact' IN labels(node) "
                 "RETURN node, score LIMIT $k",
                 {"k": top_k * 2, "vec": qvec},
             )
