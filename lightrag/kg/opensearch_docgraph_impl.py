@@ -244,6 +244,18 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 if rid not in seen_relations:
                     seen_relations[rid] = rel
 
+            # Ensure all relation endpoints are declared as entities in this chunk
+            for rel in seen_relations.values():
+                for eid_key in ("source_entity_id", "target_entity_id"):
+                    eid = rel.get(eid_key)
+                    if eid and eid not in seen_entities:
+                        seen_entities[eid] = {
+                            "entity_id": eid,
+                            "labels": ["Entity"],
+                            "properties": {"name": eid},
+                            "ontology_id": "onto:Concept",
+                        }
+
             chunks_payload.append({
                 "chunk_id": chunk_id,
                 "properties": {"text": chunk_id},  # chunk text stored elsewhere
@@ -275,7 +287,17 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             )
         except Exception as e:
             logger.error(f"Docgraph ingest failed for {doc_id}: {e}")
-            raise
+            # Log payload summary for debugging
+            logger.error(f"  Payload: {len(chunks_payload)} chunks, "
+                        f"entities={sum(len(c.get('entities',[])) for c in chunks_payload)}, "
+                        f"relations={sum(len(c.get('relations',[])) for c in chunks_payload)}")
+            if chunks_payload:
+                c0 = chunks_payload[0]
+                logger.error(f"  First chunk: id={c0.get('chunk_id')}, "
+                            f"entities={len(c0.get('entities',[]))}, "
+                            f"relations={len(c0.get('relations',[]))}")
+                if c0.get('entities'):
+                    logger.error(f"  First entity: {c0['entities'][0]}")
         finally:
             del self._doc_buffer[buf_key]
 
