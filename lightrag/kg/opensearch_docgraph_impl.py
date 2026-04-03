@@ -41,6 +41,7 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         # Per-document buffer: {buf_key: {chunks: {chunk_id: {entities, relations}}}}
         self._doc_buffer = defaultdict(lambda: {"properties": {}, "chunks": defaultdict(lambda: {"entities": [], "relations": []})})
         self._ontology_loaded = False
+        self._chunk_texts = {}  # chunk_id -> text, populated by chunks VDB
 
     # ── Cypher override ───────────────────────────────────────────────
 
@@ -267,7 +268,7 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
 
             chunks_payload.append({
                 "chunk_id": chunk_id,
-                "properties": {"text": chunk_id},  # chunk text stored elsewhere
+                "properties": {"text": self._chunk_texts.get(chunk_id, chunk_id)},
                 "entities": list(seen_entities.values()),
                 "relations": list(seen_relations.values()),
             })
@@ -302,6 +303,7 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             logger.error(f"Docgraph ingest failed for {doc_id}: {err_msg}")
         finally:
             del self._doc_buffer[buf_key]
+            self._chunk_texts.clear()
 
     # ── Embedding updates via _bulk_update_nodes ────────────────────────
 
@@ -679,6 +681,14 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
 
         import numpy as np
 
+        # If this is the Chunk VDB, store chunk text on the graph storage
+        # so flush_document can include it in the _ingest payload.
+        if self._node_label == "Chunk" and self._graph_storage:
+            for doc_id, doc_data in data.items():
+                content = doc_data.get("content", "")
+                if content:
+                    self._graph_storage._chunk_texts[doc_id] = content
+
         # Compute embeddings
         items = list(data.items())
         contents = [d.get("content", "") for _, d in items]
@@ -749,6 +759,9 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
                     continue
                 props = node.get("properties", {})
                 props["entity_name"] = props.get("name", "")
+                # Map chunk text field to content for naive mode
+                if "text" in props and "content" not in props:
+                    props["content"] = props["text"]
                 results.append(props)
             return results
         except Exception as e:
