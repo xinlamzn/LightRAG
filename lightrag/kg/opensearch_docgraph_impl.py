@@ -226,6 +226,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         if buf_key not in self._doc_buffer:
             return
 
+        await self._ensure_database_ready()
+
         buf = self._doc_buffer[buf_key]
         chunks_payload = []
 
@@ -286,18 +288,11 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 f"{nodes} nodes, {edges} edges"
             )
         except Exception as e:
-            logger.error(f"Docgraph ingest failed for {doc_id}: {e}")
-            # Log payload summary for debugging
-            logger.error(f"  Payload: {len(chunks_payload)} chunks, "
-                        f"entities={sum(len(c.get('entities',[])) for c in chunks_payload)}, "
-                        f"relations={sum(len(c.get('relations',[])) for c in chunks_payload)}")
-            if chunks_payload:
-                c0 = chunks_payload[0]
-                logger.error(f"  First chunk: id={c0.get('chunk_id')}, "
-                            f"entities={len(c0.get('entities',[]))}, "
-                            f"relations={len(c0.get('relations',[]))}")
-                if c0.get('entities'):
-                    logger.error(f"  First entity: {c0['entities'][0]}")
+            err_msg = str(e)
+            # Try to extract the response body for detailed error
+            if hasattr(e, 'info'):
+                err_msg = f"{e} | body={e.info}"
+            logger.error(f"Docgraph ingest failed for {doc_id}: {err_msg}")
         finally:
             del self._doc_buffer[buf_key]
 
