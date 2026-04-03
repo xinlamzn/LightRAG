@@ -331,6 +331,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 logger.debug(f"bulk_update_embeddings: {ok} nodes updated")
         except Exception as e:
             logger.error(f"bulk_update_embeddings failed: {e}")
+            if hasattr(e, 'info'):
+                logger.error(f"  Response: {e.info}")
 
     # ── Read queries (evidence-mediated) ──────────────────────────────
 
@@ -705,7 +707,7 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
         gs = self._graph_storage
         updates = self._pending_embeddings
         self._pending_embeddings = []
-        for j in range(0, len(updates), 500):
+        for j in range(0, len(updates), 100):
             batch = updates[j:j + 500]
             await gs.bulk_update_embeddings(batch)
 
@@ -855,7 +857,7 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
         gs = self._graph_storage
         updates = self._pending_embeddings
         self._pending_embeddings = []
-        for j in range(0, len(updates), 500):
+        for j in range(0, len(updates), 100):
             batch = updates[j:j + 500]
             await gs.bulk_update_embeddings(batch)
 
