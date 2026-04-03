@@ -2368,6 +2368,9 @@ class LightRAG:
     async def _insert_done(
         self, pipeline_status=None, pipeline_status_lock=None
     ) -> None:
+        # Flush any buffered docgraph embeddings (chunks_vdb)
+        if hasattr(self.chunks_vdb, "flush_embeddings"):
+            await self.chunks_vdb.flush_embeddings()
         tasks = [
             cast(StorageNameSpace, storage_inst).index_done_callback()
             for storage_inst in [  # type: ignore

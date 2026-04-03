@@ -725,7 +725,11 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict]:
-        """Hybrid retrieval via _plugins/_graph/retrieve."""
+        """Hybrid retrieval via _plugins/_graph/retrieve.
+
+        In docgraph mode, Entity nodes cannot be seeds. We seed on Chunks
+        (which have embeddings) with hops=1 to expand to mentioned Entities.
+        """
         gs = self._graph_storage
         await gs._ensure_database_ready()
 
@@ -736,13 +740,11 @@ class OpenSearchDocgraphVectorStorage(BaseVectorStorage):
 
         body = {
             "query_vector": qvec,
-            "query_text": query,
             "database": gs.database_name,
-            "seed_k": max(top_k, 10),
-            "top_k": top_k,
-            "hops": 0,
-            "search_fields": ["properties.name", "properties.description"],
-            "weights": {"vector_weight": 0.7, "text_weight": 0.3, "graph_weight": 0.0},
+            "seed_k": max(top_k * 2, 20),
+            "top_k": top_k * 3,  # over-fetch, filter to target label
+            "hops": 1,  # expand from Chunk seeds to Entity/RelFact neighbors
+            "weights": {"vector_weight": 1.0, "text_weight": 0.0, "graph_weight": 0.0},
         }
 
         try:
@@ -886,13 +888,11 @@ class OpenSearchDocgraphRelationshipAdapter(BaseVectorStorage):
 
         body = {
             "query_vector": qvec,
-            "query_text": query,
             "database": gs.database_name,
-            "seed_k": max(top_k, 10),
-            "top_k": top_k * 2,  # over-fetch, filter to RelFact
-            "hops": 1,  # expand to get source/target entities
-            "search_fields": ["properties.description", "properties.keywords"],
-            "weights": {"vector_weight": 0.7, "text_weight": 0.3, "graph_weight": 0.0},
+            "seed_k": max(top_k * 2, 20),
+            "top_k": top_k * 3,
+            "hops": 1,
+            "weights": {"vector_weight": 1.0, "text_weight": 0.0, "graph_weight": 0.0},
         }
 
         try:
