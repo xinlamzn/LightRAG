@@ -434,22 +434,30 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 "MATCH (c:Chunk)-[:ASSERTS]->(r:RelFact)-[:SOURCE_ENTITY]->(a:Entity), "
                 "(r)-[:TARGET_ENTITY]->(b:Entity) "
                 "WHERE a.name = $src AND b.name = $tgt "
-                "RETURN properties(r) AS props LIMIT 1",
+                "RETURN properties(r) AS props, r.weight AS w LIMIT 1",
                 {"src": source_node_id, "tgt": target_node_id},
             )
             rows = self._cypher_rows(resp)
             if rows and rows[0][0]:
-                return rows[0][0]
+                props = rows[0][0]
+                if "weight" not in props and rows[0][1] is not None:
+                    props["weight"] = rows[0][1]
+                return props
             # Try reverse direction
             resp = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:ASSERTS]->(r:RelFact)-[:SOURCE_ENTITY]->(a:Entity), "
                 "(r)-[:TARGET_ENTITY]->(b:Entity) "
                 "WHERE a.name = $tgt AND b.name = $src "
-                "RETURN properties(r) AS props LIMIT 1",
+                "RETURN properties(r) AS props, r.weight AS w LIMIT 1",
                 {"src": source_node_id, "tgt": target_node_id},
             )
             rows = self._cypher_rows(resp)
-            return rows[0][0] if rows and rows[0][0] else None
+            if rows and rows[0][0]:
+                props = rows[0][0]
+                if "weight" not in props and rows[0][1] is not None:
+                    props["weight"] = rows[0][1]
+                return props
+            return None
         except Exception:
             return None
 
@@ -573,11 +581,14 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 "MATCH (c:Chunk)-[:ASSERTS]->(r:RelFact)-[:SOURCE_ENTITY]->(a:Entity), "
                 "(r)-[:TARGET_ENTITY]->(b:Entity) "
                 "WHERE a.name IN $ids AND b.name IN $ids "
-                "RETURN a.name, b.name, properties(r)",
+                "RETURN a.name, b.name, properties(r), r.weight",
                 {"ids": all_ids},
             )
             for row in self._cypher_rows(resp):
                 src, tgt, props = str(row[0]), str(row[1]), row[2] or {}
+                # Ensure weight is present (properties(r) sometimes omits it)
+                if "weight" not in props and row[3] is not None:
+                    props["weight"] = row[3]
                 key = (src, tgt)
                 rev = (tgt, src)
                 if key in wanted and key not in result:
