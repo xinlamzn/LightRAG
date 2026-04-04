@@ -36,9 +36,9 @@ EMBEDDING_MODEL = os.environ.get(
 )
 EMBEDDING_DIM = int(os.environ.get("BEDROCK_EMBEDDING_DIM", "1024"))
 EMBEDDING_MAX_TOKEN_SIZE = int(
-GRAPH_STORAGE = os.environ.get("GRAPH_STORAGE", "OpenSearchGraphStorage")
     os.environ.get("BEDROCK_EMBEDDING_MAX_TOKEN_SIZE", "8192")
 )
+GRAPH_STORAGE = os.environ.get("GRAPH_STORAGE", "OpenSearchGraphStorage")
 
 
 def extract_queries(file_path):
