@@ -378,13 +378,18 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
-                "WHERE n.name = $id RETURN properties(n) AS props LIMIT 1",
+                "WHERE n.name = $id "
+                "RETURN properties(n) AS props, collect(c.id) AS chunk_ids LIMIT 1",
                 {"id": node_id},
             )
             rows = self._cypher_rows(resp)
             if rows and rows[0][0]:
                 props = rows[0][0]
+                chunk_ids = rows[0][1] or []
                 props["entity_name"] = props.get("name", node_id)
+                if chunk_ids:
+                    from lightrag.utils import GRAPH_FIELD_SEP
+                    props["source_id"] = GRAPH_FIELD_SEP.join(str(c) for c in chunk_ids if c)
                 return props
             return None
         except Exception:
@@ -493,16 +498,21 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         if not self._database_ready or not node_ids:
             return result
         try:
+            # Get entity properties and their source chunk IDs via MENTIONS edges
             resp = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
                 "WHERE n.name IN $ids "
-                "RETURN n.name AS eid, properties(n) AS props",
+                "RETURN n.name AS eid, properties(n) AS props, collect(c.id) AS chunk_ids",
                 {"ids": node_ids},
             )
             for row in self._cypher_rows(resp):
-                eid, props = row[0], row[1] or {}
+                eid, props, chunk_ids = row[0], row[1] or {}, row[2] or []
                 if eid and eid not in result:
                     props["entity_name"] = props.get("name", eid)
+                    # Populate source_id from MENTIONS edges for chunk selection
+                    if chunk_ids:
+                        from lightrag.utils import GRAPH_FIELD_SEP
+                        props["source_id"] = GRAPH_FIELD_SEP.join(str(c) for c in chunk_ids if c)
                     result[str(eid)] = props
         except Exception:
             pass
@@ -581,14 +591,18 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 "MATCH (c:Chunk)-[:ASSERTS]->(r:RelFact)-[:SOURCE_ENTITY]->(a:Entity), "
                 "(r)-[:TARGET_ENTITY]->(b:Entity) "
                 "WHERE a.name IN $ids AND b.name IN $ids "
-                "RETURN a.name, b.name, properties(r), r.weight",
+                "RETURN a.name, b.name, properties(r), r.weight, c.id",
                 {"ids": all_ids},
             )
             for row in self._cypher_rows(resp):
                 src, tgt, props = str(row[0]), str(row[1]), row[2] or {}
-                # Ensure weight is present (properties(r) sometimes omits it)
+                # Ensure weight is present
                 if "weight" not in props and row[3] is not None:
                     props["weight"] = row[3]
+                # Populate source_id from the asserting chunk
+                chunk_id = row[4]
+                if chunk_id:
+                    props.setdefault("source_id", str(chunk_id))
                 key = (src, tgt)
                 rev = (tgt, src)
                 if key in wanted and key not in result:
