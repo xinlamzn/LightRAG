@@ -379,7 +379,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             resp = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
                 "WHERE n.name = $id "
-                "RETURN properties(n) AS props, collect(c.id) AS chunk_ids LIMIT 1",
+                "RETURN properties(n) AS props, "
+                "collect(n.__source_chunk_id) AS chunk_ids LIMIT 1",
                 {"id": node_id},
             )
             rows = self._cypher_rows(resp)
@@ -502,7 +503,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             resp = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
                 "WHERE n.name IN $ids "
-                "RETURN n.name AS eid, properties(n) AS props, collect(c.id) AS chunk_ids",
+                "RETURN n.name AS eid, properties(n) AS props, "
+                "collect(n.__source_chunk_id) AS chunk_ids",
                 {"ids": node_ids},
             )
             for row in self._cypher_rows(resp):
@@ -591,7 +593,7 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                 "MATCH (c:Chunk)-[:ASSERTS]->(r:RelFact)-[:SOURCE_ENTITY]->(a:Entity), "
                 "(r)-[:TARGET_ENTITY]->(b:Entity) "
                 "WHERE a.name IN $ids AND b.name IN $ids "
-                "RETURN a.name, b.name, properties(r), r.weight, c.id",
+                "RETURN a.name, b.name, properties(r), r.weight, r.__source_chunk_id",
                 {"ids": all_ids},
             )
             for row in self._cypher_rows(resp):
